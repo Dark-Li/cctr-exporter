@@ -75,7 +75,11 @@ data class Question(
     }
 
     val options by lazy {
-        json.decodeFromJsonElement<List<Option>>(options_origin)
+        when (options_origin) {
+            is JsonArray -> json.decodeFromJsonElement<List<Option>>(options_origin)
+            is JsonObject -> options_origin.values.filterIsInstance<JsonObject>().map { json.decodeFromJsonElement<Option>(it) }
+            else -> throw IllegalStateException("Unexpected JSON type for options: ${options_origin::class}")
+        }
     }
 
     val answer by lazy {

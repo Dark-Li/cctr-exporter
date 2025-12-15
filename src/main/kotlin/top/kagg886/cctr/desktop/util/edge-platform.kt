@@ -25,7 +25,7 @@ fun getEdgeDownloadURL(version: String): String {
         Platform.WINDOWS -> "win64"
         Platform.LINUX -> "linux64"
     }
-    return "https://msedgedriver.azureedge.net/$version/edgedriver_$platformStr.zip"
+    return "https://msedgedriver.microsoft.com/$version/edgedriver_$platformStr.zip"
 }
 
 val msedgedriverName by lazy {
