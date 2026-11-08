@@ -11,7 +11,7 @@ val ktorVersion = extra["ktor.version"] as String
 val exposedVersion = extra["exposed.version"] as String
 
 group = "top.kagg886.cctr"
-version = "1.0-SNAPSHOT"
+version = "1.1-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -64,8 +64,12 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Exe, TargetFormat.AppImage)
             packageName = "CCTRCloudExportDesktop"
-            packageVersion = "1.0.0"
+            packageVersion = "1.1.2"
             includeAllModules = true
+            windows {
+                shortcut = true
+                menu = true
+            }
             buildTypes {
                 release {
                     proguard {
