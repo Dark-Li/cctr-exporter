@@ -11,7 +11,7 @@ val ktorVersion = extra["ktor.version"] as String
 val exposedVersion = extra["exposed.version"] as String
 
 group = "top.kagg886.cctr"
-version = "1.1-SNAPSHOT"
+version = providers.gradleProperty("app.version").get()
 
 repositories {
     mavenCentral()
@@ -52,7 +52,8 @@ kotlin {
 tasks.jar {
     manifest {
         attributes(
-            "Main-Class" to "top.kagg886.cctr.desktop.MainKt"
+            "Main-Class" to "top.kagg886.cctr.desktop.MainKt",
+            "Implementation-Version" to project.version.toString()
         )
     }
 }
@@ -60,11 +61,12 @@ tasks.jar {
 compose.desktop {
     application {
         mainClass = "top.kagg886.cctr.desktop.MainKt"
+        providers.gradleProperty("packaging.javaHome").orNull?.let { javaHome = it }
 
         nativeDistributions {
             targetFormats(TargetFormat.Exe, TargetFormat.AppImage)
             packageName = "CCTRCloudExportDesktop"
-            packageVersion = "1.1.2"
+            packageVersion = project.version.toString()
             includeAllModules = true
             windows {
                 shortcut = true

@@ -1,0 +1,31 @@
+// Optional local packaging resources. This avoids downloading WiX or rebuilding
+// an existing runtime when producing an offline Windows release.
+gradle.projectsEvaluated {
+    def project = rootProject
+    def wix = project.findProperty('packaging.wixDir')
+    def runtime = project.findProperty('packaging.runtimeImage')
+    def destination = project.findProperty('packaging.destination')
+    project.project(':modules:cctr-api').tasks.named('test').configure {
+        outputs.upToDateWhen { false }
+    }
+
+    if (wix) {
+        project.tasks.matching { it.name in ['downloadWix', 'unzipWix'] }.configureEach { enabled = false }
+    }
+    if (runtime) {
+        project.tasks.matching { it.name == 'createRuntimeImage' }.configureEach { enabled = false }
+    }
+    project.tasks.matching { it.hasProperty('wixToolsetDir') }.configureEach {
+        if (wix) wixToolsetDir.set(project.file(wix))
+        if (runtime) runtimeImage.set(project.file(runtime))
+        if (destination && name in ['packageExe', 'packageReleaseExe']) {
+            destinationDir.set(project.file(destination))
+        }
+    }
+    project.tasks.register('copyWindowsReleaseRuntime', Copy) {
+        dependsOn(project.tasks.named('jar'))
+        from(project.tasks.named('jar').flatMap { it.archiveFile })
+        from(project.configurations.runtimeClasspath)
+        into(project.layout.buildDirectory.dir("release/${project.version}/input"))
+    }
+}

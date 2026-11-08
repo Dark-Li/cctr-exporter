@@ -37,11 +37,8 @@ import top.kagg886.cctr.desktop.LocalNavigationShower
 import top.kagg886.cctr.desktop.LocalSnackBar
 import top.kagg886.cctr.desktop.page.add.ADD_ROUTE
 import top.kagg886.cctr.desktop.page.log.LOG_ROUTE
-import top.kagg886.cctr.desktop.util.CCTRConfig
-import top.kagg886.cctr.desktop.util.cctr_last_modifier
 import top.kagg886.cctr.desktop.util.root_file
 import java.awt.Desktop
-import java.time.LocalDateTime
 import kotlin.math.max
 import kotlin.math.min
 
@@ -163,25 +160,7 @@ fun HomePage() {
                                 }
 
                                 DropdownMenuItem(onClick = {
-                                    scope.launch {
-                                        val config = CCTRConfig(i.schoolId, i.username, i.password)
-                                        val task = TaskManager.commitTask(
-                                            Task(
-                                                id = -1,
-                                                schoolId = config.schoolId,
-                                                username = config.userName,
-                                                password = config.password,
-                                                status = Tasks.TaskStatus.WAITING,
-                                                exportType = i.exportType,
-                                                createTime = LocalDateTime.now(),
-                                                config = i.config
-                                            )
-                                        )
-                                        launch {
-                                            snack.showSnackbar("提交成功!，任务id为：${task.id}")
-                                        }
-                                        nav.navigate(HOME_ROUTE)
-                                    }
+                                    nav.navigate("$ADD_ROUTE/retry/${i.id}")
                                 }) {
                                     Text("重试")
                                 }

@@ -14,16 +14,18 @@ import javax.crypto.Cipher
 object RSA {
     //source from https://www.cctrcloud.net/exam/lib/config.js
     private const val PUB_KEY =
-        """MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDDLyh5Lb/5TprGvS9yFCcpCYnb0FuSyY3+TPbJI7Pv3+u4eFoqGGN46qyFOVLhUuFRttMfoA8h8yrdYCssLi93baoByTMYf5/KVlviLKXWd3TDOJdeSX4d+qLUp/WK0ckm2VaJuY5vW0x5x6WbZ8MSxwTDMqNNMgVUdOgD3MIScwIDAQAB"""
+        """MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDO3r40irpueBqKoCSh01YG8qhXXH10pgZje98q7ZvjOWad/da8Eejrbs3uyNOEwYmFJckUA8X0MiGOr3Mlv1VAXTA9T9YxbBObkLNUMj2VWLbjgZNiDzZwqeprLVvIbQSLSEUseVf/EmdCeEgMOzxnahsKKIs7u+iN13xPFBY0kwIDAQAB"""
+
+    internal val publicKey = KeyFactory.getInstance("RSA").generatePublic(
+        X509EncodedKeySpec(Base64.getDecoder().decode(PUB_KEY))
+    )
 
     private var cipher: Cipher = Cipher.getInstance("RSA")
 
     init {
         cipher.init(
             Cipher.ENCRYPT_MODE,
-            KeyFactory.getInstance("RSA").generatePublic(
-                X509EncodedKeySpec(Base64.getDecoder().decode(PUB_KEY))
-            )
+            publicKey
         )
     }
 

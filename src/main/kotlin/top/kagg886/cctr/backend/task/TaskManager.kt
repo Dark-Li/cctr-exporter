@@ -58,7 +58,10 @@ object TaskManager {
         }
     }
 
-    suspend fun commitTask(vm: Task): Task {
+    suspend fun commitTask(vm: Task, client: CCTRUser): Task {
+        require(vm.schoolId == client.schoolId && vm.username == client.userName && vm.password == client.passWord) {
+            "任务账号与当前登录会话不一致，请重新登录"
+        }
         val dbTask = checkNotNull(
             TaskService.insert(
                 Task(
@@ -76,28 +79,24 @@ object TaskManager {
             "添加任务失败"
         }
         dbTask.info("成功添加任务记录")
-        submitTask(task = dbTask)
         dbTask.info("任务已进入队列")
+        submitTask(task = dbTask, client = client)
         return dbTask
     }
 
-    private fun submitTask(task: Task) = dispatcher.launch {
-        check(task.id != -1) {
-            "请规范化taskId!"
-        }
-        check(TaskService.update(task.copy(status = Tasks.TaskStatus.PROCESSING))) {
-            "修改数据库内任务状态失败!"
-        }
+    private fun submitTask(task: Task, client: CCTRUser? = null) = dispatcher.launch {
         try {
-            task.info("任务开始执行")
-            task.info("准备登陆")
-            val cctr = CCTRUser.newCCTRUser {
-                schoolId = task.schoolId
-                username = task.username
-                password = task.password
+            check(task.id != -1) {
+                "请规范化taskId!"
             }
-            cctr.init()
-            task.info("登录成功")
+            check(TaskService.update(task.copy(status = Tasks.TaskStatus.PROCESSING))) {
+                "修改数据库内任务状态失败!"
+            }
+            task.info("任务开始执行")
+            val cctr = checkNotNull(client) {
+                "登录会话已失效，请点击重试并输入验证码重新登录"
+            }
+            task.info("使用已验证的登录会话")
 
             val questions = buildMap big@{
                 task.config.filter { (_, map) -> map.isNotEmpty() }.map { (pr, map) ->
@@ -267,6 +266,8 @@ object TaskManager {
             }
             trayChannel.send("任务id:${task.id}执行失败，原因请打开对应任务日志查看")
             return@launch
+        } finally {
+            client?.close()
         }
         check(TaskService.update(task.copy(status = Tasks.TaskStatus.SUCCESS)))
         task.info("任务记录更新成功")

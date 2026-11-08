@@ -5,7 +5,7 @@ plugins {
 val ktor_version = extra["ktor.version"] as String
 
 group = "top.kagg886.cctr"
-version = "1.0-SNAPSHOT"
+version = rootProject.version
 
 repositories {
     mavenCentral()
