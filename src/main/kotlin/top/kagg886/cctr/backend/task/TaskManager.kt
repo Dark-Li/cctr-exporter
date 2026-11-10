@@ -11,11 +11,10 @@ import top.kagg886.cctr.backend.dao.Tasks.ExportType.PDF
 import top.kagg886.cctr.backend.service.TaskService
 import top.kagg886.cctr.backend.util.error
 import top.kagg886.cctr.backend.util.info
+import top.kagg886.cctr.backend.util.warnAndSave
 import top.kagg886.cctr.desktop.trayChannel
 import top.kagg886.cctr.desktop.util.PdfExportDetails
 import top.kagg886.cctr.desktop.util.root_file
-import top.kagg886.cctr.desktop.util.writeAtomicFile
-import top.kagg886.cctr.desktop.util.writeSelectableQuestionPdf
 import top.kagg886.cctr.driver.WebDriverDispatcher
 import top.kagg886.cctr.driver.capturePdfAsset
 import top.kagg886.cctr.driver.captchaImage
@@ -87,6 +86,7 @@ object TaskManager {
 
     private fun submitTask(task: Task, client: CCTRUser? = null) = dispatcher.launch {
         val progressChannel = Channel<Int>()
+        var skippedPdfCount = 0
         try {
             check(task.id != -1) {
                 "请规范化taskId!"
@@ -144,26 +144,21 @@ object TaskManager {
                 }
             }
             val archive = root_file.resolve("out").resolve("task_${task.id}.zip")
-            if (task.exportType == PDF) useTempDictionarySuspend { output ->
-                for ((practice, chapters) in questions) {
-                    for ((chapter, chapterQuestions) in chapters) {
-                        for ((type, group) in chapterQuestions.groupBy { it.questionType.trim() }) {
-                            val details = PdfExportDetails(practice.practiceName.trim(), chapter.name.trim(), type)
-                            val pdf = output.resolve(details.title).resolve(details.chapter).resolve("$type.pdf")
-                            try {
-                                writeSelectableQuestionPdf(pdf, details, group) { fragment ->
-                                    WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) }
-                                }
-                            } catch (error: CancellationException) {
-                                throw error
-                            } catch (error: Exception) {
-                                throw IllegalStateException("PDF 排版失败：${details.title} / ${details.chapter} / $type；${error.message}", error)
-                            }
-                            repeat(group.size) { progressChannel.send(0) }
+            if (task.exportType == PDF) {
+                val groups = questions.flatMap { (practice, chapters) ->
+                    chapters.flatMap { (chapter, chapterQuestions) ->
+                        chapterQuestions.groupBy { it.questionType.trim() }.map { (type, group) ->
+                            PdfExportDetails(practice.practiceName.trim(), chapter.name.trim(), type) to group
                         }
                     }
                 }
-                writeAtomicFile(archive) { output.zip(it) }
+                skippedPdfCount = writeQuestionPdfArchive(
+                    archive,
+                    groups,
+                    onGroupProcessed = { count -> repeat(count) { progressChannel.send(0) } },
+                    reportSkipped = task::warnAndSave,
+                    renderComplex = { fragment -> WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) } },
+                )
             } else useTempDictionarySuspend { root ->
                 //download image
                 questions.map { (pr, map) ->
@@ -253,6 +248,8 @@ object TaskManager {
         }
         check(TaskService.update(task.copy(status = Tasks.TaskStatus.SUCCESS)))
         task.info("任务记录更新成功")
-        trayChannel.send("任务id:${task.id}执行成功")
+        val result = if (skippedPdfCount == 0) "执行成功"
+            else "部分导出完成，${skippedPdfSummary(skippedPdfCount)}"
+        trayChannel.send("任务id:${task.id}$result")
     }
 }

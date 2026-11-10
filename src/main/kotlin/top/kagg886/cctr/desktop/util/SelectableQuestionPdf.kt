@@ -21,20 +21,38 @@ import kotlinx.coroutines.CancellationException
 import org.jsoup.Jsoup
 import top.kagg886.cctr.api.modules.Question
 import top.kagg886.cctr.driver.CapturedPdfAsset
+import java.io.EOFException
 import java.io.File
+import java.util.zip.ZipException
+
+internal data class QuestionPdfResult(val exportedCount: Int, val skippedIds: List<String>)
 
 internal suspend fun writeSelectableQuestionPdf(
     file: File,
     details: PdfExportDetails,
     questions: List<Question>,
     renderComplex: suspend (String) -> CapturedPdfAsset = { error("此题含需要 Edge 渲染的局部内容") },
-) {
+): QuestionPdfResult {
     require(questions.isNotEmpty()) { "没有可导出的题目" }
     // The old PNG path kept the later value when the same question ID appeared twice in a group.
     val ordered = questions.associateBy { it.id }.values.sortedWith(compareBy(naturalQuestionOrder) { it.id })
-    writeAtomicPdf(file) { pdf ->
-        SelectableQuestionLayout(pdf, details, renderComplex).write(ordered)
+    val (exportable, skipped) = ordered.partition(Question::hasDecodableSubject)
+    if (exportable.isNotEmpty()) {
+        writeAtomicPdf(file) { pdf ->
+            SelectableQuestionLayout(pdf, details, renderComplex).write(exportable)
+        }
     }
+    return QuestionPdfResult(exportable.size, skipped.map(Question::id))
+}
+
+private fun Question.hasDecodableSubject(): Boolean = try {
+    subjectHtml.isNotBlank()
+} catch (_: IllegalArgumentException) {
+    false // Invalid Base64.
+} catch (_: EOFException) {
+    false // Truncated gzip header or body.
+} catch (_: ZipException) {
+    false // Invalid gzip header, compressed data or checksum.
 }
 
 private class SelectableQuestionLayout(

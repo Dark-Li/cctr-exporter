@@ -2,6 +2,7 @@ package top.kagg886.cctr.backend.service
 
 import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.batchInsert
 import org.jetbrains.exposed.sql.statements.UpdateBuilder
 import top.kagg886.cctr.backend.dao.Logger
 import top.kagg886.cctr.backend.dao.Loggers
@@ -23,6 +24,12 @@ object LoggerService : BaseService<Loggers, Logger>(Loggers) {
         state[Loggers.level] = level
         state[Loggers.message] = message
         state[Loggers.createTime] = createTime
+    }
+
+    suspend fun insertAll(entries: List<Logger>) {
+        dbQuery {
+            Loggers.batchInsert(entries, shouldReturnGeneratedValues = false) { entry -> entry.toDAO(this) }
+        }
     }
 
     suspend fun getLoggerByTaskId(taskId: Int, since: LocalDateTime? = null) = query {

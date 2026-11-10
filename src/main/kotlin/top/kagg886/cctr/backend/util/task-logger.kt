@@ -19,18 +19,17 @@ fun Task.log(level: Loggers.LoggerLevel, msg: String) {
         Loggers.LoggerLevel.WARN -> logger.warn("[Task:${id}]: $msg")
         Loggers.LoggerLevel.ERROR -> logger.error("[Task:${id}]: $msg")
     }
-    scope.launch {
-        LoggerService.insert(
-            Logger(
-                id = -1,
-                taskId = id,
-                level = level,
-                message = msg,
-                createTime = LocalDateTime.now()
-            )
-        )
-    }
+    scope.launch { LoggerService.insert(logEntry(level, msg)) }
 }
+
+internal suspend fun Task.warnAndSave(messages: List<String>) {
+    LoggerService.insertAll(messages.map { logEntry(Loggers.LoggerLevel.WARN, it) })
+    messages.forEach { logger.warn("[Task:$id]: $it") }
+}
+
+private fun Task.logEntry(level: Loggers.LoggerLevel, msg: String) =
+    Logger(id = -1, taskId = id, level = level, message = msg, createTime = LocalDateTime.now())
+
 fun Task.info(msg:String) = log(Loggers.LoggerLevel.INFO,msg)
 fun Task.warn(msg:String) = log(Loggers.LoggerLevel.WARN,msg)
 fun Task.error(msg:String) = log(Loggers.LoggerLevel.ERROR,msg)

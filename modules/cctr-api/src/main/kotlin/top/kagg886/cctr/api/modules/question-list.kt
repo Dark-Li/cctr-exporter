@@ -56,7 +56,7 @@ data class Question(
     @SerialName("questiontypename")
     val questionType: String,
 
-    internal val subjecthtml_svg: String,
+    internal val subjecthtml_svg: String? = null,
     internal val answerhtml_svg: String,
     @SerialName("answer")
     internal val answer_origin: String?,
@@ -65,7 +65,7 @@ data class Question(
     internal val options_origin: JsonElement,
 ) {
     val subjectHtml by lazy {
-        subjecthtml_svg.toByteArray().decompress().decodeToString()
+        subjecthtml_svg.orEmpty().toByteArray().decompress().decodeToString()
     }
 
     val hasOptions by lazy {
