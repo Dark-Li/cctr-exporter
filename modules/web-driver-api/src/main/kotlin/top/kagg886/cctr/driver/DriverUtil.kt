@@ -55,7 +55,13 @@ suspend fun EdgeDriver.captchaImage(html: String): BufferedImage {
     }.asDeferred().await()
 }
 
-data class CapturedPdfAsset(val image: BufferedImage, val cssWidth: Int, val cssHeight: Int)
+data class CapturedPdfAsset(
+    val image: BufferedImage,
+    val cssWidth: Int,
+    val cssHeight: Int,
+    val contentHeightCssPixels: Float = cssHeight.toFloat(),
+    val bottomInsetCssPixels: Float = 0f,
+)
 
 /** Render only the complex fragment used by a selectable PDF. */
 suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = withContext(Dispatchers.IO) {
@@ -96,8 +102,11 @@ suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = wit
               .then(() => {
                 if (images.some(image => image.naturalWidth === 0)) return null;
                 const rect = asset.getBoundingClientRect();
-                return [Math.ceil(Math.max(rect.width, asset.scrollWidth)),
-                        Math.ceil(Math.max(rect.height, asset.scrollHeight)), window.devicePixelRatio];
+                const width = Math.ceil(Math.max(rect.width, asset.scrollWidth));
+                const height = Math.ceil(Math.max(rect.height, asset.scrollHeight));
+                const content = asset.firstElementChild?.getBoundingClientRect();
+                const bottomInset = content ? Math.max(0, height - content.bottom) : 0;
+                return [width, height, window.devicePixelRatio, content?.height ?? height, bottomInset];
               });
             const timeout = new Promise((_, fail) => setTimeout(fail, 10000));
             Promise.race([ready, timeout]).then(done, () => done(null));
@@ -125,7 +134,7 @@ suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = wit
             check(image.width == width * pixelsPerCssPixel && image.height == height * pixelsPerCssPixel) {
                 "局部渲染像素尺寸与公式边界不符"
             }
-            CapturedPdfAsset(image, width, height)
+            CapturedPdfAsset(image, width, height, (dimensions[3] as Number).toFloat(), (dimensions[4] as Number).toFloat())
         } finally {
             executeCdpCommand("Emulation.setDefaultBackgroundColorOverride", emptyMap())
         }

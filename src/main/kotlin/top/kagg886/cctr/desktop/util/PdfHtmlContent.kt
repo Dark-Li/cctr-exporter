@@ -13,8 +13,16 @@ import com.itextpdf.layout.element.ListItem
 import com.itextpdf.layout.element.Paragraph
 import com.itextpdf.layout.element.Table
 import com.itextpdf.layout.element.Text
+import com.itextpdf.layout.layout.LayoutContext
+import com.itextpdf.layout.layout.LayoutResult
+import com.itextpdf.layout.properties.InlineVerticalAlignment
+import com.itextpdf.layout.properties.InlineVerticalAlignmentType
 import com.itextpdf.layout.properties.ListNumberingType
+import com.itextpdf.layout.properties.Property
+import com.itextpdf.layout.properties.RenderingMode
 import com.itextpdf.layout.properties.UnitValue
+import com.itextpdf.layout.renderer.IRenderer
+import com.itextpdf.layout.renderer.ImageRenderer
 import com.itextpdf.svg.converter.SvgConverter
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -59,21 +67,39 @@ internal class PdfHtmlContent(
         var hasContent = false
         var pendingLabel = label
         var previousSpace = false
+        var lineHasText = false
+        var hasAlignedFormula = false
+        val lineFormulas = mutableListOf<InlinePdfImage>()
 
         fun start() {
             if (pendingLabel.isNotEmpty()) {
                 paragraph.add(pdfText(pendingLabel).setBold())
                 pendingLabel = ""
                 previousSpace = true
+                lineHasText = true
             }
             hasContent = true
         }
 
+        fun finishLine() {
+            if (lineHasText && lineFormulas.isNotEmpty()) {
+                lineFormulas.forEach { (image, baselineFraction) ->
+                    image.setNextRenderer(FormulaImageRenderer(image, baselineFraction))
+                }
+                hasAlignedFormula = true
+            }
+            lineFormulas.clear()
+            lineHasText = false
+        }
+
         fun flush() {
+            finishLine()
+            if (hasAlignedFormula) paragraph.setProperty(Property.RENDERING_MODE, RenderingMode.HTML_MODE)
             if (hasContent) emit(paragraph)
             paragraph = paragraph()
             hasContent = false
             previousSpace = false
+            hasAlignedFormula = false
         }
 
         suspend fun visit(node: Node, format: InlineFormat) {
@@ -92,13 +118,31 @@ internal class PdfHtmlContent(
                     if (format.underline) run.setUnderline()
                     if (format.rise != 0f) run.setTextRise(format.rise).setFontSize(8.5f)
                     paragraph.add(run)
+                    if (format.preformatted && '\n' in value) {
+                        lineHasText = lineHasText || value.substringBefore('\n').hasVisiblePdfText()
+                        finishLine()
+                        lineHasText = value.substringAfterLast('\n').hasVisiblePdfText()
+                    } else {
+                        lineHasText = lineHasText || value.hasVisiblePdfText()
+                    }
                     previousSpace = value.endsWith(' ')
                 }
                 is Element -> {
                     if (node.isHiddenPdfContent()) return
                     when (val name = node.normalName()) {
-                        "br" -> { start(); paragraph.add(pdfText("\n")); previousSpace = true }
-                        "img", "svg", "math" -> { start(); paragraph.add(image(node, availableWidth)); previousSpace = false }
+                        "br" -> {
+                            start()
+                            finishLine()
+                            paragraph.add(pdfText("\n"))
+                            previousSpace = true
+                        }
+                        "img", "svg", "math" -> {
+                            start()
+                            val asset = image(node, availableWidth)
+                            if (asset.baselineFraction != 0f) lineFormulas.add(asset)
+                            paragraph.add(asset.image)
+                            previousSpace = false
+                        }
                         "table" -> {
                             if (pendingLabel.isNotEmpty()) start()
                             flush()
@@ -191,7 +235,7 @@ internal class PdfHtmlContent(
         }
     }
 
-    private suspend fun image(element: Element, availableWidth: Float): Image {
+    private suspend fun image(element: Element, availableWidth: Float): InlinePdfImage {
         val name = element.normalName()
         val svgSource = when (name) {
             "svg" -> element.outerHtml()
@@ -202,7 +246,9 @@ internal class PdfHtmlContent(
         if (svgSource != null && !element.hasCssSvgSizing() && supportsVectorSvg(svgSource)) {
             val vector = runCatching { Image(SvgConverter.convertToXObject(svgSource, pdf)) }.getOrNull()
             if (vector != null && vector.imageWidth > 0 && vector.imageHeight > 0) {
-                return sizeImage(vector, element.pdfWidth() ?: vector.imageWidth, availableWidth)
+                val preferredWidth = element.pdfWidth() ?: vector.imageWidth
+                val cssHeight = vector.imageHeight * preferredWidth / vector.imageWidth / pointsPerCssPixel
+                return element.alignFormula(sizeImage(vector, preferredWidth, availableWidth), svgSource, cssHeight)
             }
         }
         if (name == "img") {
@@ -210,7 +256,9 @@ internal class PdfHtmlContent(
             require(source.isNotEmpty()) { "题目图片缺少地址" }
             if (source.startsWith("data:image/", ignoreCase = true) && svgSource == null) {
                 val raster = Image(ImageDataFactory.create(decodeDataImage(source)))
-                return sizeImage(raster, element.pdfWidth() ?: raster.imageWidth * 0.75f, availableWidth)
+                val preferredWidth = element.pdfWidth() ?: raster.imageWidth * pointsPerCssPixel
+                val cssHeight = raster.imageHeight * preferredWidth / raster.imageWidth / pointsPerCssPixel
+                return element.alignFormula(sizeImage(raster, preferredWidth, availableWidth), null, cssHeight)
             }
             if (svgSource == null) {
                 val url = URI(if (source.startsWith("//")) "https:$source" else source)
@@ -220,11 +268,42 @@ internal class PdfHtmlContent(
         }
         val rendered = renderComplex(element.outerHtml())
         val bytes = ByteArrayOutputStream().also { check(ImageIO.write(rendered.image, "PNG", it)) }.toByteArray()
-        return sizeImage(Image(ImageDataFactory.create(bytes)), rendered.cssWidth * 0.75f, availableWidth)
+        val image = sizeImage(Image(ImageDataFactory.create(bytes)), rendered.cssWidth * pointsPerCssPixel, availableWidth)
+        return element.alignFormula(
+            image, svgSource, rendered.cssHeight.toFloat(), rendered.contentHeightCssPixels, rendered.bottomInsetCssPixels,
+        )
     }
 
     private fun Element.pdfWidth(): Float? = attr("width").removeSuffix("px").toFloatOrNull()
-        ?.takeIf { it > 0 && it.isFinite() }?.times(0.75f)
+        ?.takeIf { it > 0 && it.isFinite() }?.times(pointsPerCssPixel)
+
+    private fun Element.alignFormula(
+        image: Image,
+        svgSource: String?,
+        cssHeight: Float,
+        contentHeight: Float = cssHeight,
+        bottomInset: Float = 0f,
+    ): InlinePdfImage {
+        val wrapper = parent()?.takeIf { it.normalName() == "span" && it.childrenSize() == 1 && !it.ownText().hasVisiblePdfText() }
+        if (attr("display").equals("block", ignoreCase = true) ||
+            blockDisplay.containsMatchIn(attr("style")) || blockDisplay.containsMatchIn(wrapper?.attr("style").orEmpty())) {
+            return InlinePdfImage(image)
+        }
+        val declaration = verticalAlignDeclaration() ?: wrapper?.verticalAlignDeclaration()
+        val cssOffset = declaration?.cssBaselineOffset()
+        val wiris = svgSource?.contains("wrs:baseline") == true
+        if (normalName() != "math" && classNames().none { it.equals("Wirisformula", ignoreCase = true) } &&
+            !wiris && (svgSource == null || cssOffset == null)) {
+            return InlinePdfImage(image)
+        }
+        val sourceOffset = if (declaration != null) {
+            cssOffset?.takeIf { it in -contentHeight..contentHeight } ?: 0f
+        } else {
+            if (wiris) wirisBaselineFraction(svgSource.orEmpty()) * contentHeight else 0f
+        }
+        val fraction = (sourceOffset - bottomInset) / cssHeight
+        return InlinePdfImage(image, fraction.takeIf(Float::isFinite) ?: 0f)
+    }
 
     private fun sizeImage(image: Image, preferredWidth: Float, availableWidth: Float): Image {
         val originalWidth = image.imageWidth
@@ -283,6 +362,49 @@ internal class PdfHtmlContent(
     }
 }
 
+private data class InlinePdfImage(val image: Image, val baselineFraction: Float = 0f)
+
+private class FormulaImageRenderer(private val image: Image, private val baselineFraction: Float) : ImageRenderer(image) {
+    override fun layout(context: LayoutContext): LayoutResult {
+        val result = super.layout(context)
+        result.occupiedArea?.getBBox()?.height?.let { height ->
+            // iText may fit the image again to the remaining line width.
+            setProperty(
+                Property.INLINE_VERTICAL_ALIGNMENT,
+                InlineVerticalAlignment(InlineVerticalAlignmentType.FIXED, baselineFraction * height),
+            )
+        }
+        return result
+    }
+
+    override fun getNextRenderer(): IRenderer = FormulaImageRenderer(image, baselineFraction)
+}
+
+private fun Element.verticalAlignDeclaration(): String? {
+    val values = verticalAlign.findAll(attr("style")).map { it.groupValues[1].trim() }.toList()
+    return values.lastOrNull { it.endsWith("!important", ignoreCase = true) } ?: values.lastOrNull()
+}
+
+private fun String.cssBaselineOffset(): Float? {
+    val value = substringBefore('!').trim().lowercase()
+    if (value == "baseline") return 0f
+    val match = cssBaselineLength.matchEntire(value) ?: return null
+    val amount = match.groupValues[1].toFloatOrNull()?.takeIf(Float::isFinite) ?: return null
+    return when (match.groupValues[2]) {
+        "px" -> amount
+        "pt" -> amount / pointsPerCssPixel
+        else -> amount.takeIf { it == 0f }
+    }
+}
+
+private fun wirisBaselineFraction(source: String): Float {
+    val root = Jsoup.parse(source, "", Parser.xmlParser()).children().singleOrNull() ?: return 0f
+    if (root.normalName() != "svg") return 0f
+    val height = root.attr("height").trim().removeSuffix("px").toFloatOrNull()?.takeIf { it > 0 && it.isFinite() } ?: return 0f
+    val baseline = root.attr("wrs:baseline").toFloatOrNull()?.takeIf { it in 0f..height } ?: return 0f
+    return (baseline - height) / height
+}
+
 private fun supportsVectorSvg(source: String): Boolean {
     val root = Jsoup.parse(source, "", Parser.xmlParser()).children().singleOrNull() ?: return false
     if (root.normalName() != "svg" || root.select(vectorShapes.joinToString(",")).isEmpty()) return false
@@ -337,3 +459,7 @@ private val vectorAttributes = setOf(
 )
 private val svgAbsoluteLength = Regex("[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:px|pt)?", RegexOption.IGNORE_CASE)
 private val svgCssSize = Regex("(?:^|;)\\s*(?:(?:min|max)-)?(?:width|height)\\s*:", RegexOption.IGNORE_CASE)
+private const val pointsPerCssPixel = 0.75f
+private val verticalAlign = Regex("(?:^|;)\\s*vertical-align\\s*:\\s*([^;]+)", RegexOption.IGNORE_CASE)
+private val cssBaselineLength = Regex("([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))(px|pt)?")
+private val blockDisplay = Regex("(?:^|;)\\s*display\\s*:\\s*block\\b", RegexOption.IGNORE_CASE)
