@@ -7,18 +7,19 @@ import top.kagg886.cctr.api.modules.QueryModel
 import top.kagg886.cctr.api.modules.queryQuestionList
 import top.kagg886.cctr.backend.dao.Task
 import top.kagg886.cctr.backend.dao.Tasks
-import top.kagg886.cctr.backend.dao.Tasks.ExportType.IMG
 import top.kagg886.cctr.backend.dao.Tasks.ExportType.PDF
 import top.kagg886.cctr.backend.service.TaskService
 import top.kagg886.cctr.backend.util.error
 import top.kagg886.cctr.backend.util.info
 import top.kagg886.cctr.desktop.trayChannel
-import top.kagg886.cctr.desktop.util.convertToPDF
+import top.kagg886.cctr.desktop.util.PdfExportDetails
 import top.kagg886.cctr.desktop.util.root_file
+import top.kagg886.cctr.desktop.util.writeAtomicFile
+import top.kagg886.cctr.desktop.util.writeSelectableQuestionPdf
 import top.kagg886.cctr.driver.WebDriverDispatcher
+import top.kagg886.cctr.driver.capturePdfAsset
 import top.kagg886.cctr.driver.captchaImage
 import top.kagg886.cctr.util.mergeVertical
-import top.kagg886.cctr.util.useTempDictionary
 import top.kagg886.cctr.util.useTempDictionarySuspend
 import top.kagg886.cctr.util.zip
 import java.awt.image.BufferedImage
@@ -85,6 +86,7 @@ object TaskManager {
     }
 
     private fun submitTask(task: Task, client: CCTRUser? = null) = dispatcher.launch {
+        val progressChannel = Channel<Int>()
         try {
             check(task.id != -1) {
                 "请规范化taskId!"
@@ -123,7 +125,7 @@ object TaskManager {
             }
             val all = questions.toMap().flatMap { it.value.flatMap { it1 -> it1.value } }.size
             task.info("查询需要导出的题目成功，共${all}个")
-            val progressChannel = Channel<Int>()
+            if (task.exportType == PDF) check(all > 0) { "没有可导出的题目" }
             var progress = 0
             val percentArr = (1..10).map {
                 (all / 10) * it
@@ -141,7 +143,28 @@ object TaskManager {
                     }
                 }
             }
-            useTempDictionarySuspend { root ->
+            val archive = root_file.resolve("out").resolve("task_${task.id}.zip")
+            if (task.exportType == PDF) useTempDictionarySuspend { output ->
+                for ((practice, chapters) in questions) {
+                    for ((chapter, chapterQuestions) in chapters) {
+                        for ((type, group) in chapterQuestions.groupBy { it.questionType.trim() }) {
+                            val details = PdfExportDetails(practice.practiceName.trim(), chapter.name.trim(), type)
+                            val pdf = output.resolve(details.title).resolve(details.chapter).resolve("$type.pdf")
+                            try {
+                                writeSelectableQuestionPdf(pdf, details, group) { fragment ->
+                                    WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) }
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                throw IllegalStateException("PDF 排版失败：${details.title} / ${details.chapter} / $type；${error.message}", error)
+                            }
+                            repeat(group.size) { progressChannel.send(0) }
+                        }
+                    }
+                }
+                writeAtomicFile(archive) { output.zip(it) }
+            } else useTempDictionarySuspend { root ->
                 //download image
                 questions.map { (pr, map) ->
                     async(Dispatchers.IO) {
@@ -213,51 +236,9 @@ object TaskManager {
                     }
                 }.awaitAll()
 
-                when (task.exportType) {
-                    PDF -> {
-                        //root/练习名/章节名/题型名/图片
-                        useTempDictionary { tmp ->
-                            for (prFile in root.listFiles()!!) { //练习名
-                                for (cpFile in prFile.listFiles()!!) { //章节名
-                                    for (qFile in cpFile.listFiles()!!) { //题型名
-                                        qFile.listFiles()!!.toList().convertToPDF(
-                                            tmp.resolve(prFile.name).resolve(cpFile.name).resolve(qFile.name + ".pdf")
-                                                .apply {
-                                                    parentFile.mkdirs()
-                                                    createNewFile()
-                                                }
-                                        )
-                                    }
-                                }
-                            }
-                            tmp.zip(
-                                out = root_file.resolve("out").resolve("task_" + task.id.toString() + ".zip")
-                                    .apply {
-                                        if (exists()) {
-                                            delete()
-                                        }
-                                        parentFile.mkdirs()
-                                        createNewFile()
-                                    }
-                            )
-                        }
-                    }
-
-                    IMG -> {
-                        root.zip(
-                            out = root_file.resolve("out").resolve("task_" + task.id.toString() + ".zip")
-                                .apply {
-                                    if (exists()) {
-                                        delete()
-                                    }
-                                    parentFile.mkdirs()
-                                    createNewFile()
-                                }
-                        )
-                    }
-                }
+                archive.parentFile.mkdirs()
+                root.zip(archive)
             }
-            progressChannel.close()
         } catch (e: Throwable) {
             e.printStackTrace()
             task.error("任务执行失败:${e::class.jvmName} ${e.message}")
@@ -267,6 +248,7 @@ object TaskManager {
             trayChannel.send("任务id:${task.id}执行失败，原因请打开对应任务日志查看")
             return@launch
         } finally {
+            progressChannel.close()
             client?.close()
         }
         check(TaskService.update(task.copy(status = Tasks.TaskStatus.SUCCESS)))

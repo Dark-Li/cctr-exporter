@@ -77,20 +77,42 @@ data class Question(
     val options by lazy {
         when (options_origin) {
             is JsonArray -> json.decodeFromJsonElement<List<Option>>(options_origin)
-            is JsonObject -> options_origin.values.filterIsInstance<JsonObject>().map { json.decodeFromJsonElement<Option>(it) }
+            is JsonObject -> options_origin.entries.mapNotNull { (key, value) ->
+                (value as? JsonObject)?.let { json.decodeFromJsonElement<Option>(it).copy(sourceKey = key) }
+            }
             else -> throw IllegalStateException("Unexpected JSON type for options: ${options_origin::class}")
         }
     }
 
     val answer by lazy {
-        if (answerhtml_svg.isEmpty()) answer_origin!! else answerhtml_svg.toByteArray().decompress().decodeToString()
+        formattedAnswerHtml ?: answer_origin!!
+    }
+
+    val formattedAnswerHtml by lazy {
+        answerhtml_svg.takeIf { it.isNotBlank() }?.toByteArray()?.decompress()?.decodeToString()
+    }
+
+    val plainAnswer: String? get() = answer_origin
+
+    /** Fill-in entries contain answer fragments and need not carry choice correctness flags. */
+    fun fillBlankOptionHtml(): Sequence<String> {
+        val entries = when (options_origin) {
+            is JsonArray -> options_origin.asSequence()
+            is JsonObject -> options_origin.values.asSequence()
+            else -> emptySequence()
+        }
+        return entries.mapNotNull { entry ->
+            ((entry as? JsonObject)?.get("questionoptionhtml_svg") as? JsonPrimitive)
+                ?.contentOrNull?.takeIf(String::isNotBlank)
+        }.map { it.toByteArray().decompress().decodeToString() }
     }
 }
 
 @Serializable
 data class Option(
     internal val istrue: Int,
-    internal val questionoptionhtml_svg: String
+    internal val questionoptionhtml_svg: String,
+    @kotlinx.serialization.Transient val sourceKey: String? = null,
 ) {
     val isTrue: Boolean by lazy {
         istrue == 1

@@ -53,9 +53,12 @@ object WebDriverDispatcher {
     }
 
 
-    suspend fun useDriver(block:suspend (EdgeDriver) -> Unit) {
+    suspend fun <T> useDriver(block: suspend (EdgeDriver) -> T): T {
         val driver = queue.receive()
-        block(driver)
-        queue.send(driver)
+        try {
+            return block(driver)
+        } finally {
+            queue.trySend(driver)
+        }
     }
 }

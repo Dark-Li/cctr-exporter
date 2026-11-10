@@ -28,6 +28,7 @@ dependencies {
 
     testImplementation(kotlin("test"))
     implementation("com.itextpdf:itext7-core:8.0.4")
+    implementation("org.jsoup:jsoup:1.17.2")
 
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     implementation("moe.tlaster:precompose:1.6.0")

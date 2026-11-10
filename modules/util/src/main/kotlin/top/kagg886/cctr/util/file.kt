@@ -6,14 +6,20 @@ import kotlin.io.path.createTempDirectory
 
 fun useTempDictionary(block: (File) -> Unit) {
     val f = createTempDirectory("cctr").toFile()
-    block(f)
-    f.deleteRecursively()
+    try {
+        block(f)
+    } finally {
+        f.deleteRecursively()
+    }
 }
 
 suspend fun useTempDictionarySuspend(block: suspend (File) -> Unit) {
     val f = createTempDirectory("cctr").toFile()
-    block(f)
-    f.deleteRecursively()
+    try {
+        block(f)
+    } finally {
+        f.deleteRecursively()
+    }
 }
 
 fun useTempFile(suffix:String = "",block: (File) -> Unit) {
