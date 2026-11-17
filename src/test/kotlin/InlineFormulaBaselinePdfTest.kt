@@ -27,6 +27,18 @@ import kotlin.test.assertTrue
 
 class InlineFormulaBaselinePdfTest {
     @Test
+    fun scalesCssAlignmentWithBrowserPrefitAndKeepsMeasuredInsets() = runBlocking {
+        val output = File("build/inline-formula-baseline-validation/prefit-origin.pdf")
+        writeSelectableQuestionPdf(output, PdfExportDetails("预适配后的基线"), listOf(question(
+            "<p>缩放前<math style='vertical-align:-10px'><mi>x</mi></math>缩放后</p>",
+        ))) { capturedFormula(104, 54, 50f, 2f).copy(sourceCssScale = 0.5f) }
+        val measured = inspect(output)
+        val baseline = measured.text.single { it.value.contains("缩放前") }.baseline
+        assertEquals(-5.25f, measured.images.single().bottom - baseline, 0.03f)
+        assertTrue(measured.text.any { it.value.contains("缩放后") })
+    }
+
+    @Test
     fun positionsInlineVectorFormulaByTheExplicitCssOffset() = runBlocking {
         val output = File("build/inline-formula-baseline-validation/vector.pdf")
         val svg = """<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><path d="M1 2H39M8 4V18" stroke="black"/></svg>"""
