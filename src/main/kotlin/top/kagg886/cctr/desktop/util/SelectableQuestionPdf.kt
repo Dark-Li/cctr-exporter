@@ -109,6 +109,7 @@ private class SelectableQuestionLayout(
         pdf.getOutlines(false).addOutline(label).addDestination(PdfStringDestination(anchor))
         val block = Div().setBorderTop(SolidBorder(rule, 0.5f)).setPaddingTop(7f).setMarginBottom(10f)
         block.add(heading("$label  ${question.questionType}", 9.5f, accent).setDestination(anchor).setMarginBottom(6f))
+        html.sourceStage = "题干"
         html.addHtml(question.subjectHtml, block::add)
 
         if (question.questionType.trim() == "填空题") {
@@ -132,12 +133,14 @@ private class SelectableQuestionLayout(
                 val prefix = if (visibleLabels[index] == null && semanticAnswer == null) "$optionLabel. " else ""
                 val optionIndent = 8f
                 val optionBlock = Div().setMarginLeft(optionIndent)
+                html.sourceStage = "选项${index + 1}"
                 html.addNodes(body.childNodes(), optionBlock::add, prefix, bodyWidth - optionIndent)
                 block.add(optionBlock)
                 if (option.isTrue) correct.add(semanticAnswer ?: optionLabel)
             }
             block.add(answerLine(correct.joinToString("、").ifBlank { "平台未提供" }))
         } else {
+            html.sourceStage = "参考答案"
             val formatted = question.formattedAnswerHtml?.takeIf { it.isNotBlank() }
             if (formatted != null) {
                 block.add(answerHeading())
@@ -150,6 +153,7 @@ private class SelectableQuestionLayout(
     }
 
     private suspend fun addFillBlankAnswer(question: Question, block: Div) {
+        html.sourceStage = "参考答案"
         val formatted = question.formattedAnswerHtml?.let(::visiblePdfHtmlNodes)
         if (formatted != null) {
             block.add(answerHeading())
@@ -174,8 +178,11 @@ private class SelectableQuestionLayout(
 
     private fun answerHeading(): Paragraph = heading("参考答案", 10f, accent).setMarginTop(5f).setMarginBottom(3f)
 
-    private fun answerLine(value: String): Paragraph = Paragraph(html.pdfText("参考答案：$value"))
-        .setFontColor(accent).setFontSize(10.5f).setMarginTop(4f).setMarginBottom(0f)
+    private fun answerLine(value: String): Paragraph {
+        html.sourceStage = "参考答案"
+        return Paragraph(html.pdfText("参考答案：$value"))
+            .setFontColor(accent).setFontSize(10.5f).setMarginTop(4f).setMarginBottom(0f)
+    }
 
     private fun heading(value: String, size: Float, color: DeviceRgb): Paragraph = Paragraph(html.pdfText(value))
         .setFontColor(color).setFontSize(size).setMargin(0f).setKeepWithNext(true)
