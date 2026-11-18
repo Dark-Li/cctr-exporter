@@ -1,6 +1,10 @@
 package top.kagg886.cctr.backend.task
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import top.kagg886.cctr.api.modules.Question
 import top.kagg886.cctr.desktop.util.PdfExportDetails
 import top.kagg886.cctr.desktop.util.writeAtomicFile
@@ -10,6 +14,7 @@ import top.kagg886.cctr.util.useTempDictionarySuspend
 import top.kagg886.cctr.util.zip
 import java.io.File
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 internal suspend fun writeQuestionPdfArchive(
     archive: File,
     groups: Iterable<Pair<PdfExportDetails, List<Question>>>,
@@ -18,25 +23,44 @@ internal suspend fun writeQuestionPdfArchive(
     renderComplex: suspend (String) -> CapturedPdfAsset,
 ): Int {
     val skippedIds = linkedSetOf<String>()
+    val failureMessages = mutableListOf<String>()
     var exportedCount = 0
+    val ordered = groups.toList()
     useTempDictionarySuspend { output ->
-        for ((details, group) in groups) {
-            val pdf = output.resolve(details.title).resolve(details.chapter).resolve("${details.questionType}.pdf")
-            val result = try {
-                writeSelectableQuestionPdf(pdf, details, group, renderComplex)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                throw IllegalStateException(
-                    "PDF 排版失败：${details.title} / ${details.chapter} / ${details.questionType}；${error.message}",
-                    error,
-                )
-            }
+        // Each group owns its own PdfDocument, so groups can be laid out concurrently; results are
+        // merged in input order so skipped IDs keep their deterministic reporting order.
+        val results = coroutineScope {
+            val dispatcher = Dispatchers.IO.limitedParallelism(minOf(maxParallelGroups, ordered.size).coerceAtLeast(1))
+            ordered.map { (details, group) ->
+                async(dispatcher) {
+                    val pdf = output.resolve(details.title).resolve(details.chapter).resolve("${details.questionType}.pdf")
+                    try {
+                        val result = writeSelectableQuestionPdf(pdf, details, group, renderComplex)
+                        onGroupProcessed(group.size)
+                        Result.success(result)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        // Returning the failure keeps the cause chain intact; rethrowing across a
+                        // dispatcher boundary makes kotlinx.coroutines copy the exception.
+                        Result.failure(
+                            IllegalStateException(
+                                "PDF 排版失败：${details.title} / ${details.chapter} / ${details.questionType}；${error.message}",
+                                error,
+                            )
+                        )
+                    }
+                }
+            }.awaitAll()
+        }
+        results.firstOrNull { it.isFailure }?.exceptionOrNull()?.let { throw it }
+        results.forEach {
+            val result = it.getOrThrow()
             exportedCount += result.exportedCount
             skippedIds.addAll(result.skippedIds)
-            onGroupProcessed(group.size)
+            failureMessages.addAll(result.failureMessages)
         }
-        val messages = skippedPdfLogMessages(skippedIds)
+        val messages = skippedPdfLogMessages(skippedIds) + failureLogMessages(failureMessages)
         if (exportedCount > 0) {
             writeAtomicFile(archive) { temporary ->
                 output.zip(temporary)
@@ -51,6 +75,12 @@ internal suspend fun writeQuestionPdfArchive(
 }
 
 internal fun skippedPdfSummary(count: Int) = "$count 道题未导出成功，已跳过"
+
+/**
+ * Groups write to separate PDF files, so they can be laid out in parallel. The bound keeps the
+ * Edge capture pool (10 drivers) and peak image memory in check on small machines.
+ */
+private const val maxParallelGroups = 4
 
 private fun skippedPdfLogMessages(skippedIds: Set<String>): List<String> = buildList {
     if (skippedIds.isEmpty()) return@buildList
@@ -69,4 +99,9 @@ private fun skippedPdfLogMessages(skippedIds: Set<String>): List<String> = build
         }
     }
     if (line.isNotEmpty()) add(prefix + line)
+}
+
+private fun failureLogMessages(failures: List<String>): List<String> = failures.map { failure ->
+    val line = "排版失败：$failure"
+    if (line.length <= 200) line else line.take(199) + "…"
 }

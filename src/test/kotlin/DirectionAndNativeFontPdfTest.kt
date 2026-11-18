@@ -81,6 +81,23 @@ class DirectionAndNativeFontPdfTest {
     }
 
     @Test
+    fun skipsOnlyQuestionWithUnsupportedDirectionText() = runBlocking {
+        val output = File("build/direction-font-pdf-validation/rtl-skip.pdf")
+        val result = writeSelectableQuestionPdf(output, PdfExportDetails("方向隔离"), listOf(
+            question("正常题干一", "答案"),
+            question("\u05E9\u05DC\u05D5\u05DD", "答案").copy(id = "42732303"),
+            question("正常题干三", "答案").copy(id = "42732304"),
+        ))
+        assertEquals(2, result.exportedCount)
+        assertEquals(listOf("42732303"), result.skippedIds)
+        assertTrue(result.failureMessages.single().contains("双向文本"), result.failureMessages.single())
+        PdfDocument(PdfReader(output)).use { pdf ->
+            val text = PdfTextExtractor.getTextFromPage(pdf.getPage(1))
+            assertTrue(text.contains("正常题干一") && text.contains("正常题干三"), text)
+        }
+    }
+
+    @Test
     fun preservesZeroWidthControlsInNativeAnswersAndActualText() = runBlocking {
         val output = File("build/direction-font-pdf-validation/joining-controls.pdf")
         val expected = "答案前中\u200C文 A\u200DB π\u2060x C\uFEFFD答案后"
@@ -148,13 +165,19 @@ class DirectionAndNativeFontPdfTest {
 
     @Test
     fun doesNotReuseNativeFontCacheForUnverifiedSameNameCustomFont() = runBlocking {
-        val error = assertFailsWith<IllegalStateException> {
-            writeSelectableQuestionPdf(File("build/direction-font-pdf-validation/custom.pdf"), PdfExportDetails("字体身份"), listOf(
-                question("<font face='Times New Roman'>First</font>", "正常答案"),
-                question("<style>@font-face{font-family:'Times New Roman';src:url(data:font/ttf;base64,AA==)}</style><font face='Times New Roman'>Second</font>", "正常答案").copy(id = "42732303"),
-            ))
+        val output = File("build/direction-font-pdf-validation/custom.pdf")
+        val result = writeSelectableQuestionPdf(output, PdfExportDetails("字体身份"), listOf(
+            question("<font face='Times New Roman'>First</font>", "正常答案"),
+            question("<style>@font-face{font-family:'Times New Roman';src:url(data:font/ttf;base64,AA==)}</style><font face='Times New Roman'>Second</font>", "正常答案").copy(id = "42732303"),
+        ))
+        assertEquals(1, result.exportedCount)
+        assertEquals(listOf("42732303"), result.skippedIds)
+        assertTrue(result.failureMessages.single().contains("自定义字体尚未验证"), result.failureMessages.single())
+        PdfDocument(PdfReader(output)).use { pdf ->
+            val text = PdfTextExtractor.getTextFromPage(pdf.getPage(1))
+            assertTrue(text.contains("First"), text)
+            assertFalse(text.contains("Second"), text)
         }
-        assertTrue(error.message.orEmpty().contains("自定义字体尚未验证"), error.message)
     }
 
     private fun question(stem: String, answer: String) =

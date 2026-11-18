@@ -3,8 +3,6 @@ package top.kagg886.cctr.desktop.util
 import com.itextpdf.io.image.ImageDataFactory
 import com.itextpdf.kernel.colors.DeviceRgb
 import com.itextpdf.kernel.font.PdfFont
-import com.itextpdf.kernel.font.PdfFontFactory
-import com.itextpdf.io.font.PdfEncodings
 import com.itextpdf.kernel.pdf.PdfDocument
 import com.itextpdf.layout.borders.SolidBorder
 import com.itextpdf.layout.element.Cell
@@ -44,28 +42,72 @@ internal class PdfHtmlContent(
     private val width: Float,
     private val renderComplex: suspend (String) -> CapturedPdfAsset,
 ) {
-    private val checkedGlyphs = mutableSetOf<Int>()
-    private val nativeFonts = mutableMapOf<Pair<Boolean, Boolean>, PdfFont>()
+    private val fonts = PdfFontResolver(font)
     var sourceStage: String = "文档信息"
 
-    fun pdfText(value: String): Text {
-        value.validatePdfJoiningContext(sourceStage)
-        return nativeText(value.pdfLtrText(sourceStage), font)
+    internal data class PdfTextRun(val font: PdfFont, val text: String, val bold: Boolean, val italic: Boolean)
+
+    /** Split plain text into font runs; used by headings, answers, canvas furniture and fit(). */
+    fun runs(value: String, bold: Boolean = false, italic: Boolean = false): List<PdfTextRun> {
+        val text = value.pdfLtrText(sourceStage)
+        text.validatePdfJoiningContext(sourceStage)
+        val result = mutableListOf<PdfTextRun>()
+        val buffer = StringBuilder()
+        val pendingControls = StringBuilder()
+        var current: PdfFont? = null
+        fun flush() {
+            if (buffer.isNotEmpty() && current != null) {
+                result += PdfTextRun(current!!, buffer.toString(), bold, italic)
+                buffer.setLength(0)
+            }
+        }
+        text.codePoints().forEach { point ->
+            if (isPdfZeroWidthControl(point)) {
+                // Leading controls attach to the next visible glyph, trailing ones stay in the run.
+                if (current == null || buffer.isEmpty()) pendingControls.appendCodePoint(point)
+                else buffer.appendCodePoint(point)
+                return@forEach
+            }
+            val selected = if (Character.isISOControl(point)) font else when (val route = fonts.route(point, null, sourceStage, bold, italic)) {
+                is GlyphRoute.Native -> route.font
+                GlyphRoute.SourceGlyph -> throw PdfSourceFont(null, "未声明").error(point, sourceStage, "纯文本缺少来源字体")
+                is GlyphRoute.Unsupported -> throw PdfSourceFont(null, "未声明")
+                    .error(point, sourceStage, "已尝试=${route.attempts.joinToString("、")}")
+            }
+            if (selected !== current) {
+                flush()
+                current = selected
+                buffer.append(pendingControls)
+                pendingControls.setLength(0)
+            }
+            buffer.appendCodePoint(point)
+        }
+        flush()
+        return result
+    }
+
+    fun appendRuns(target: Paragraph, value: String, bold: Boolean = false, italic: Boolean = false) {
+        for (run in runs(value, bold, italic)) {
+            val text = nativeText(run.text, run.font)
+            if (run.bold && (run.font === font || fonts.isFallback(run.font))) text.setBold()
+            // Synthetic italic on a fallback run shifts the following run and leaks a space into
+            // extraction; symbol fonts keep their regular slant instead.
+            if (run.italic && run.font === font) text.setItalic()
+            target.add(text)
+        }
     }
 
     private fun nativeText(value: String, selected: PdfFont): Text {
         value.codePoints().forEach { point ->
-            if (point in pdfZeroWidthControls) return@forEach
-            if (selected !== font) return@forEach
-            if (!Character.isISOControl(point) && point !in checkedGlyphs) {
-                if (!font.containsGlyph(point)) throw PdfSourceFont(null, "未声明").error(point, sourceStage, "需要核实源字体及字形")
-                checkedGlyphs.add(point)
-                val glyph = font.fontProgram.getGlyphByCode(font.getGlyph(point).code)
-                // The bundled font shares some Han glyphs with radicals. Keep the ordinary Han
-                // character in this document's ToUnicode map, independent of other exports.
-                if (glyph != null && point in 0x3400..0x9FFF && glyph.unicode != point) {
-                    glyph.setChars(Character.toChars(point))
-                }
+            if (isPdfZeroWidthControl(point) || Character.isISOControl(point)) return@forEach
+            if (!selected.containsGlyph(point)) {
+                throw PdfSourceFont(null, "未声明").error(point, sourceStage, "字体路由未覆盖")
+            }
+            val glyph = selected.fontProgram.getGlyphByCode(selected.getGlyph(point).code)
+            // Shared glyphs lose their ToUnicode identity in a subset. The bundled font already
+            // corrects Han radicals; fallback fonts need the same treatment for every code point.
+            if (glyph != null && glyph.unicode != point && (selected !== font || point in 0x3400..0x9FFF)) {
+                glyph.setChars(Character.toChars(point))
             }
         }
         return formatControlText(value, selected)
@@ -88,9 +130,11 @@ internal class PdfHtmlContent(
         }
         val firstText = nodes.flatMap(::visibleTextNodes).firstOrNull { it.wholeText.isNotBlank() }
         val styles = nodes.firstOrNull()?.ownerDocument()?.select("style")?.joinToString("\n") { it.data() }.orEmpty()
-        require(directionDeclaration.findAll(styles).all { match ->
-            match.groupValues[2].trim().removeSuffix("!important").trim().lowercase() in setOf("ltr", "normal")
-        }) { "PDF 暂不支持双向文本；阶段=$sourceStage；来源=方向样式规则" }
+        if (directionDeclaration.findAll(styles).any { match ->
+                match.groupValues[2].trim().removeSuffix("!important").trim().lowercase() !in setOf("ltr", "normal")
+            }) {
+            throw PdfContentNotSupportedException("PDF 暂不支持双向文本；阶段=$sourceStage；来源=方向样式规则")
+        }
         var paragraph = paragraph()
         var hasContent = false
         var pendingLabel = label
@@ -103,7 +147,7 @@ internal class PdfHtmlContent(
 
         fun start() {
             if (pendingLabel.isNotEmpty()) {
-                paragraph.add(pdfText(pendingLabel).setBold())
+                appendRuns(paragraph, pendingLabel, bold = true)
                 pendingLabel = ""
                 previousSpace = true
                 lineHasText = true
@@ -124,7 +168,9 @@ internal class PdfHtmlContent(
         }
 
         fun flush() {
-            require(pendingFormatControls.isEmpty()) { "零宽格式控制没有可附着的可见文字；阶段=$sourceStage" }
+            if (pendingFormatControls.isNotEmpty()) {
+                throw PdfContentNotSupportedException("零宽格式控制没有可附着的可见文字；阶段=$sourceStage")
+            }
             finishLine()
             if (hasAlignedFormula) paragraph.setProperty(Property.RENDERING_MODE, RenderingMode.HTML_MODE)
             if (hasContent) emit(paragraph)
@@ -145,13 +191,16 @@ internal class PdfHtmlContent(
                     if (value.isEmpty()) return
                     value.forEachIndexed { index, character ->
                         if (character == '\u2060' || character == '\uFEFF') {
-                            require((index > 0 && index < value.lastIndex) ||
-                                (character == '\uFEFF' && index == 0 && node === firstText)) {
-                                "PDF 尚不支持跨文字节点的禁止换行控制；阶段=$sourceStage；码点=U+${character.code.toString(16).uppercase()}"
+                            val attachable = (index > 0 && index < value.lastIndex) ||
+                                (character == '\uFEFF' && index == 0 && node === firstText)
+                            if (!attachable) {
+                                throw PdfContentNotSupportedException(
+                                    "PDF 尚不支持跨文字节点的禁止换行控制；阶段=$sourceStage；码点=U+${character.code.toString(16).uppercase()}",
+                                )
                             }
                         }
                     }
-                    if (value.codePoints().allMatch { it in pdfZeroWidthControls }) {
+                    if (value.codePoints().allMatch { isPdfZeroWidthControl(it) }) {
                         val preceding = lastNative
                         if (preceding != null) {
                             val logical = preceding.second + value
@@ -162,13 +211,6 @@ internal class PdfHtmlContent(
                     }
                     start()
                     val source = PdfSourceFont.from(node)
-                    val preferred = if (source.family.equals("Times New Roman", true)) {
-                        if (source.custom) throw source.error(value.codePointAt(0), sourceStage, "自定义字体尚未验证")
-                        nativeFonts.getOrPut(format.bold to format.italic) {
-                            PdfFontFactory.createFont(requireNotNull(source.nativeTimesBytes(format.bold, format.italic, sourceStage)),
-                                PdfEncodings.IDENTITY_H, PdfFontFactory.EmbeddingStrategy.FORCE_EMBEDDED, false)
-                        }
-                    } else null
                     val mapped = value.codePoints().toArray().map(source::mapSymbol)
                     var native = StringBuilder()
                     var runFont = font
@@ -179,7 +221,9 @@ internal class PdfHtmlContent(
                         val logical = pendingFormatControls + native.toString()
                         pendingFormatControls = ""
                         val run = nativeText(logical, runFont)
-                        if (format.bold && runFont === font) run.setBold()
+                        if (format.bold && (runFont === font || fonts.isFallback(runFont))) run.setBold()
+                        // Synthetic italic on a fallback run shifts the following run and leaks a
+                        // space into extraction; symbol fonts keep their regular slant instead.
                         if (format.italic && runFont === font) run.setItalic()
                         if (format.underline) run.setUnderline()
                         if (format.rise != 0f) run.setTextRise(format.rise).setFontSize(8.5f)
@@ -190,27 +234,31 @@ internal class PdfHtmlContent(
                     suspend fun flushSource() {
                         if (sourceRun.isEmpty()) return
                         val asset = renderSourceGlyph(sourceRun.toString(), source, format, availableWidth)
-                        require(pendingFormatControls.isEmpty()) { "无法验证图片前的零宽格式控制；阶段=$sourceStage" }
+                        if (pendingFormatControls.isNotEmpty()) {
+                            throw PdfContentNotSupportedException("无法验证图片前的零宽格式控制；阶段=$sourceStage")
+                        }
                         lineFormulas.add(asset)
                         paragraph.add(asset.image)
                         lastNative = null
                         sourceRun = StringBuilder()
                     }
                     for (point in mapped) {
-                        require((point != 0x2060 && point != 0xFEFF) || sourceRun.isEmpty()) {
-                            "PDF 尚不支持跨字体或图片的禁止换行控制；阶段=$sourceStage"
+                        if ((point == 0x2060 || point == 0xFEFF) && sourceRun.isNotEmpty()) {
+                            throw PdfContentNotSupportedException("PDF 尚不支持跨字体或图片的禁止换行控制；阶段=$sourceStage")
                         }
                         val selected = when {
-                            point in pdfZeroWidthControls -> runFont
+                            isPdfZeroWidthControl(point) -> runFont
                             Character.getType(point) == Character.PRIVATE_USE.toInt() -> null
-                            preferred?.containsGlyph(point) == true -> preferred
-                            Character.isISOControl(point) || font.containsGlyph(point) -> font
-                            else -> null
-                        }
-                        if (noBreakNext && point !in pdfZeroWidthControls) {
-                            require(selected != null && selected === runFont) {
-                                "PDF 尚不支持跨字体或图片的禁止换行控制；阶段=$sourceStage"
+                            else -> when (val route = fonts.route(point, source, sourceStage, format.bold, format.italic)) {
+                                is GlyphRoute.Native -> route.font
+                                GlyphRoute.SourceGlyph -> null
+                                is GlyphRoute.Unsupported -> throw source.error(
+                                    point, sourceStage, "已尝试=${route.attempts.joinToString("、")}",
+                                )
                             }
+                        }
+                        if (noBreakNext && !isPdfZeroWidthControl(point) && (selected == null || selected !== runFont)) {
+                            throw PdfContentNotSupportedException("PDF 尚不支持跨字体或图片的禁止换行控制；阶段=$sourceStage")
                         }
                         if (selected != null) {
                             flushSource()
@@ -222,7 +270,7 @@ internal class PdfHtmlContent(
                             sourceRun.appendCodePoint(point)
                         }
                         if (point == 0x2060 || point == 0xFEFF) noBreakNext = true
-                        else if (point !in pdfZeroWidthControls) noBreakNext = false
+                        else if (!isPdfZeroWidthControl(point)) noBreakNext = false
                     }
                     flushSource()
                     flushNative()
@@ -237,20 +285,22 @@ internal class PdfHtmlContent(
                 }
                 is Element -> {
                     if (node.isHiddenPdfContent()) return
-                    require(!node.attr("dir").equals("rtl", true) && directionDeclaration.findAll(node.attr("style")).all { match ->
-                        match.groupValues[2].trim().removeSuffix("!important").trim().lowercase() in setOf("ltr", "normal")
-                    }) {
-                        "PDF 暂不支持双向文本；阶段=$sourceStage；来源=方向样式"
+                    if (node.attr("dir").equals("rtl", true) || directionDeclaration.findAll(node.attr("style")).any { match ->
+                            match.groupValues[2].trim().removeSuffix("!important").trim().lowercase() !in setOf("ltr", "normal")
+                        }) {
+                        throw PdfContentNotSupportedException("PDF 暂不支持双向文本；阶段=$sourceStage；来源=方向样式")
                     }
                     when (val name = node.normalName()) {
                         "br" -> {
                             start()
                             finishLine()
-                            paragraph.add(pdfText("\n"))
+                            appendRuns(paragraph, "\n")
                             previousSpace = true
                         }
                         "img", "svg", "math" -> {
-                            require(pendingFormatControls.isEmpty()) { "无法验证图片前的零宽格式控制；阶段=$sourceStage" }
+                            if (pendingFormatControls.isNotEmpty()) {
+                                throw PdfContentNotSupportedException("无法验证图片前的零宽格式控制；阶段=$sourceStage")
+                            }
                             start()
                             val asset = image(node, availableWidth)
                             if (asset.baselineFraction != 0f) lineFormulas.add(asset)

@@ -25,7 +25,13 @@ import java.io.EOFException
 import java.io.File
 import java.util.zip.ZipException
 
-internal data class QuestionPdfResult(val exportedCount: Int, val skippedIds: List<String>)
+internal data class QuestionPdfResult(
+    val exportedCount: Int,
+    val skippedIds: List<String>,
+    val failureMessages: List<String> = emptyList(),
+)
+
+private data class QuestionFailure(val id: String, val message: String)
 
 internal suspend fun writeSelectableQuestionPdf(
     file: File,
@@ -37,12 +43,24 @@ internal suspend fun writeSelectableQuestionPdf(
     // The old PNG path kept the later value when the same question ID appeared twice in a group.
     val ordered = questions.associateBy { it.id }.values.sortedWith(compareBy(naturalQuestionOrder) { it.id })
     val (exportable, skipped) = ordered.partition(Question::hasDecodableSubject)
+    var failures: List<QuestionFailure> = emptyList()
     if (exportable.isNotEmpty()) {
         writeAtomicPdf(file) { pdf ->
-            SelectableQuestionLayout(pdf, details, renderComplex).write(exportable)
+            failures = SelectableQuestionLayout(pdf, details, renderComplex).write(exportable)
+            // Keep the previous archive when nothing could be laid out, instead of replacing it
+            // with a header-only PDF.
+            if (failures.size == exportable.size) {
+                throw IllegalStateException(
+                    failures.joinToString("\n") { "题目 ID ${it.id} 无法排版：${it.message}" },
+                )
+            }
         }
     }
-    return QuestionPdfResult(exportable.size, skipped.map(Question::id))
+    return QuestionPdfResult(
+        exportedCount = exportable.size - failures.size,
+        skippedIds = skipped.map(Question::id) + failures.map(QuestionFailure::id),
+        failureMessages = failures.map { "${it.id}：${it.message}" },
+    )
 }
 
 private fun Question.hasDecodableSubject(): Boolean = try {
@@ -74,10 +92,12 @@ private class SelectableQuestionLayout(
     private val html = PdfHtmlContent(pdf, font, bodyWidth, renderComplex)
     private val continuationPages = mutableMapOf<Int, Int>()
 
-    suspend fun write(questions: List<Question>) {
+    suspend fun write(questions: List<Question>): List<QuestionFailure> {
         pdf.documentInfo.setTitle(listOf(details.title, details.chapter, details.questionType).filter(String::isNotBlank).joinToString(" / "))
         pdf.documentInfo.setCreator("CCTRCloudExportDesktop")
         pdf.catalog.setLang(PdfString("zh-CN"))
+        val failures = mutableListOf<QuestionFailure>()
+        var exported = 0
         // Keep pages writable until the final page count is known.
         Document(pdf, pageSize, false).use { document ->
             document.setMargins(top, side, bottom, side)
@@ -85,28 +105,43 @@ private class SelectableQuestionLayout(
             document.add(heading("题库导出", 9f, accent).setMarginBottom(5f))
             document.add(heading(details.title.ifBlank { "题库" }, 20f, ink).setMarginBottom(5f))
             document.add(heading(listOf(details.chapter, details.questionType, "共 ${questions.size} 题").filter(String::isNotBlank).joinToString(" / "), 10f, muted).setMarginBottom(15f))
-            questions.forEachIndexed { index, question ->
+            for (question in questions) {
+                val block = try {
+                    // Numbering stays continuous over exported questions; the real ID is in the heading.
+                    questionBlock(exported + 1, question)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: PdfQuestionSkippedException) {
+                    failures += QuestionFailure(question.id, error.message ?: error.javaClass.simpleName)
+                    continue
+                } catch (error: Exception) {
+                    throw IllegalStateException("题目 ID ${question.id} 无法排版：${error.message ?: error.javaClass.simpleName}", error)
+                }
+                exported++
                 try {
-                    val block = questionBlock(index + 1, question)
                     val measure = block.createRendererSubTree().setParent(document.renderer)
                         .layout(LayoutContext(LayoutArea(1, Rectangle(bodyWidth, bodyHeight))))
                     if (measure.status == LayoutResult.FULL) block.setKeepTogether(true)
-                    block.setNextRenderer(QuestionContinuationRenderer(block, index + 1, continuationPages))
+                    block.setNextRenderer(QuestionContinuationRenderer(block, exported, continuationPages))
                     document.add(block)
+                    // Add the bookmark only after the block reached the document, otherwise a skipped
+                    // question would leave an orphan outline entry.
+                    pdf.getOutlines(false).addOutline("第 $exported 题 · ID ${question.id}")
+                        .addDestination(PdfStringDestination("question-$exported"))
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
                     throw IllegalStateException("题目 ID ${question.id} 无法排版：${error.message ?: error.javaClass.simpleName}", error)
                 }
             }
-            addPageFurniture()
+            if (exported > 0) addPageFurniture()
         }
+        return failures
     }
 
     private suspend fun questionBlock(number: Int, question: Question): Div {
         val label = "第 $number 题 · ID ${question.id}"
         val anchor = "question-$number"
-        pdf.getOutlines(false).addOutline(label).addDestination(PdfStringDestination(anchor))
         val block = Div().setBorderTop(SolidBorder(rule, 0.5f)).setPaddingTop(7f).setMarginBottom(10f)
         block.add(heading("$label  ${question.questionType}", 9.5f, accent).setDestination(anchor).setMarginBottom(6f))
         html.sourceStage = "题干"
@@ -180,12 +215,16 @@ private class SelectableQuestionLayout(
 
     private fun answerLine(value: String): Paragraph {
         html.sourceStage = "参考答案"
-        return Paragraph(html.pdfText("参考答案：$value"))
-            .setFontColor(accent).setFontSize(10.5f).setMarginTop(4f).setMarginBottom(0f)
+        val paragraph = Paragraph()
+        html.appendRuns(paragraph, "参考答案：$value")
+        return paragraph.setFontColor(accent).setFontSize(10.5f).setMarginTop(4f).setMarginBottom(0f)
     }
 
-    private fun heading(value: String, size: Float, color: DeviceRgb): Paragraph = Paragraph(html.pdfText(value))
-        .setFontColor(color).setFontSize(size).setMargin(0f).setKeepWithNext(true)
+    private fun heading(value: String, size: Float, color: DeviceRgb): Paragraph {
+        val paragraph = Paragraph()
+        html.appendRuns(paragraph, value)
+        return paragraph.setFontColor(color).setFontSize(size).setMargin(0f).setKeepWithNext(true)
+    }
 
     private fun addPageFurniture() {
         val total = pdf.numberOfPages
@@ -210,20 +249,36 @@ private class SelectableQuestionLayout(
 
     private fun fit(value: String, width: Float): String {
         val plain = value.replace(Regex("\\s+"), " ")
-        if (font.getWidth(plain, 8f) <= width) return plain
+        if (measure(plain) <= width) return plain
         return buildString {
             for (point in plain.codePoints().toArray()) {
                 val character = String(Character.toChars(point))
-                if (font.getWidth(toString() + character + "…", 8f) > width) break
+                if (measure(toString() + character + "…") > width) break
                 append(character)
             }
             append("…")
         }
     }
 
+    private fun measure(value: String): Float =
+        html.runs(value).sumOf { it.font.getWidth(it.text.pdfDrawableText(), 8f).toDouble() }.toFloat()
+
     private fun canvasText(canvas: PdfCanvas, value: String, x: Float, y: Float) {
-        canvas.beginText().setFontAndSize(font, 8f).setFillColor(muted)
-            .moveText(x.toDouble(), y.toDouble()).showText(html.pdfText(value).text).endText()
+        var cursor = x
+        for (run in html.runs(value)) {
+            val text = run.text.pdfDrawableText()
+            if (text.isEmpty()) continue
+            canvas.beginText().setFontAndSize(run.font, 8f).setFillColor(muted)
+                .moveText(cursor.toDouble(), y.toDouble()).showText(text).endText()
+            cursor += run.font.getWidth(text, 8f)
+        }
+    }
+
+    /** Zero-width controls have no glyph; canvas text cannot carry ActualText for them. */
+    private fun String.pdfDrawableText(): String {
+        val builder = StringBuilder()
+        codePoints().forEach { if (!isPdfZeroWidthControl(it)) builder.appendCodePoint(it) }
+        return builder.toString()
     }
 }
 

@@ -7,11 +7,14 @@ import java.awt.font.FontRenderContext
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.text.Normalizer
 
 /** Only explicit source identities may give a private-use character its meaning. */
 internal data class PdfSourceFont(val family: String?, val origin: String, val custom: Boolean = false) {
+    val isTimes: Boolean get() = family.equals("Times New Roman", true)
+
     fun nativeTimesBytes(bold: Boolean, italic: Boolean, stage: String): ByteArray? {
-        if (!family.equals("Times New Roman", true)) return null
+        if (!isTimes) return null
         if (custom) throw error(0, stage, "自定义字体尚未验证")
         val suffix = when { bold && italic -> "bi"; bold -> "bd"; italic -> "i"; else -> "" }
         val windows = System.getenv("WINDIR") ?: throw error(0, stage, "系统源字体不可用")
@@ -21,11 +24,7 @@ internal data class PdfSourceFont(val family: String?, val origin: String, val c
         val exact = Font.createFont(Font.TRUETYPE_FONT, bytes.inputStream())
         if (!exact.family.equals("Times New Roman", true)) throw error(0, stage, "字体文件身份不符")
         // OS/2.fsType: honor restricted/bitmap-only embedding and no-subsetting permissions.
-        val table = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
-        val count = table.getShort(4).toInt() and 0xffff
-        val os2 = (0 until count).map { 12 + 16 * it }.firstOrNull { table.getInt(it) == 0x4F532F32 }
-            ?: throw error(0, stage, "字体嵌入权限不可验证")
-        val fsType = table.getShort(table.getInt(os2 + 8) + 8).toInt() and 0xffff
+        val fsType = fontEmbeddingPermission(bytes) ?: throw error(0, stage, "字体嵌入权限不可验证")
         if (fsType and 0x0302 != 0) throw error(0, stage, "字体不允许当前嵌入方式")
         return bytes
     }
@@ -35,9 +34,9 @@ internal data class PdfSourceFont(val family: String?, val origin: String, val c
         when (point) { 0xF070 -> 0x03C0; 0xF0BB -> 0x2248; else -> point }
     } else point
 
-    fun error(point: Int, stage: String, reason: String): IllegalArgumentException {
+    fun error(point: Int, stage: String, reason: String): PdfGlyphNotSupportedException {
         val name = family?.replace(Regex("[\\p{Cntrl}<>]"), "")?.take(64) ?: "未声明"
-        return IllegalArgumentException(
+        return PdfGlyphNotSupportedException(
             "PDF 字体不支持 U+${point.toString(16).uppercase()}；阶段=$stage；源字体=$name；来源=$origin；$reason",
         )
     }
@@ -88,11 +87,11 @@ internal data class PdfSourceFont(val family: String?, val origin: String, val c
                     else -> null
                 } ?: continue
                 val family = firstFamily.find(selected.first.trim())?.let {
-                    it.groupValues.drop(1).firstOrNull(String::isNotEmpty)?.trim()
-                } ?: continue
+                    normalizeFamily(it.groupValues.drop(1).firstOrNull(String::isNotEmpty))
+                }?.takeIf(String::isNotEmpty) ?: continue
                 if (family.equals("inherit", true) || family.equals("unset", true)) continue
                 val custom = fontFaceRule.findAll(styles).any { face ->
-                    fontFamilyDeclaration(face.groupValues[1])?.value?.trim()?.trim('\'', '"')?.equals(family, true) == true
+                    fontFamilyDeclaration(face.groupValues[1])?.value?.let(::normalizeFamily)?.equals(family, true) == true
                 }
                 return PdfSourceFont(family, selected.second, custom)
             }
@@ -100,6 +99,36 @@ internal data class PdfSourceFont(val family: String?, val origin: String, val c
         }
     }
 }
+
+/**
+ * Font identities come from source CSS and may carry zero-width or non-breaking characters that
+ * browsers ignore. Normalize before any equality check; the visible bytes must stay untouched.
+ */
+internal fun normalizeFamily(raw: String?): String {
+    if (raw == null) return ""
+    return Normalizer.normalize(raw, Normalizer.Form.NFKC)
+        .replace(familyFormatChars, "")
+        .replace(familySpaces, " ")
+        .trim()
+        .trim('\'', '"', '\u2018', '\u2019', '\u201C', '\u201D')
+        .trim()
+}
+
+private val familyFormatChars = Regex("[\\p{Cf}]")
+private val familySpaces = Regex("\\s+")
+
+/** OS/2 fsType, or null when the table cannot be read. */
+internal fun fontEmbeddingPermission(bytes: ByteArray): Int? = runCatching {
+    if (bytes.size < 12) return@runCatching null
+    val table = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+    val count = table.getShort(4).toInt() and 0xffff
+    val os2 = (0 until count).map { 12 + 16 * it }.firstOrNull { table.getInt(it) == 0x4F532F32 }
+        ?: return@runCatching null
+    table.getShort(table.getInt(os2 + 8) + 8).toInt() and 0xffff
+}.getOrNull()
+
+internal fun allowsFontEmbedding(bytes: ByteArray): Boolean =
+    fontEmbeddingPermission(bytes)?.let { it and 0x0302 == 0 } == true
 
 private data class FontDeclaration(val value: String, val important: Boolean)
 
