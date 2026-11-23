@@ -19,6 +19,7 @@ import com.itextpdf.layout.renderer.DivRenderer
 import com.itextpdf.layout.renderer.IRenderer
 import kotlinx.coroutines.CancellationException
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
 import top.kagg886.cctr.api.modules.Question
 import top.kagg886.cctr.driver.CapturedPdfAsset
 import java.io.EOFException
@@ -147,33 +148,28 @@ private class SelectableQuestionLayout(
         html.sourceStage = "题干"
         html.addHtml(question.subjectHtml, block::add)
 
+        // 综合题的父级只有引导语，题干和答案都在 subquestions；逐小题排版，避免落到父级的空答案。
+        if (question.subquestions.isNotEmpty()) {
+            addSubQuestionStems(question, block)
+            addSubQuestionAnswers(question, block)
+            return block
+        }
+
         if (question.questionType.trim() == "填空题") {
             addFillBlankAnswer(question, block)
             return block
         }
 
-        val choices = if (question.hasOptions) question.options else emptyList()
-        if (choices.isNotEmpty()) {
-            val choiceBodies = choices.map { Jsoup.parseBodyFragment(it.html).body() }
-            val visibleLabels = choiceBodies.map { optionPrefix.find(it.text())?.groupValues?.get(1)?.uppercase() }
-            val sourceLabels = choices.map { it.sourceKey?.trim()?.takeIf(optionKey::matches)?.uppercase() }
-            val reservedLabels = visibleLabels.zip(sourceLabels) { visible, key -> visible ?: key }.filterNotNull().toMutableSet()
-            val correct = mutableListOf<String>()
-            val judgment = question.questionType.contains("判断") || question.questionType.contains("是非")
-            choices.forEachIndexed { index, option ->
-                val body = choiceBodies[index]
-                val semanticAnswer = body.text().replaceFirst(optionPrefix, "").trim().trimEnd('。', '！', '.', '!')
-                    .takeIf { judgment && it in judgmentLabels }
-                val optionLabel = visibleLabels[index] ?: sourceLabels[index] ?: nextOptionLabel(index, reservedLabels)
-                val prefix = if (visibleLabels[index] == null && semanticAnswer == null) "$optionLabel. " else ""
-                val optionIndent = 8f
+        val presentation = question.choicePresentation()
+        if (presentation != null) {
+            val optionIndent = 8f
+            presentation.bodies.forEachIndexed { index, body ->
                 val optionBlock = Div().setMarginLeft(optionIndent)
                 html.sourceStage = "选项${index + 1}"
-                html.addNodes(body.childNodes(), optionBlock::add, prefix, bodyWidth - optionIndent)
+                html.addNodes(body.childNodes(), optionBlock::add, presentation.prefixes[index], bodyWidth - optionIndent)
                 block.add(optionBlock)
-                if (option.isTrue) correct.add(semanticAnswer ?: optionLabel)
             }
-            block.add(answerLine(correct.joinToString("、").ifBlank { "平台未提供" }))
+            block.add(answerLine(presentation.correct.joinToString("、").ifBlank { "平台未提供" }))
         } else {
             html.sourceStage = "参考答案"
             val formatted = question.formattedAnswerHtml?.takeIf { it.isNotBlank() }
@@ -212,6 +208,56 @@ private class SelectableQuestionLayout(
     }
 
     private fun answerHeading(): Paragraph = heading("参考答案", 10f, accent).setMarginTop(5f).setMarginBottom(3f)
+
+    private suspend fun addSubQuestionStems(question: Question, block: Div) {
+        question.subquestions.forEachIndexed { index, sub ->
+            val label = subQuestionLabel(index)
+            html.sourceStage = "第 ${index + 1} 小题题干"
+            val nodes = visiblePdfHtmlNodes(sub.subjectHtml)
+            if (nodes == null) {
+                block.add(subTextLine(label + "题干缺失"))
+                return@forEachIndexed
+            }
+            val indent = 12f
+            val stem = Div().setMarginLeft(indent).setMarginTop(4f)
+            html.addNodes(nodes, stem::add, label, bodyWidth - indent)
+            block.add(stem)
+        }
+    }
+
+    private suspend fun addSubQuestionAnswers(question: Question, block: Div) {
+        block.add(answerHeading())
+        question.subquestions.forEachIndexed { index, sub ->
+            html.sourceStage = "第 ${index + 1} 小题参考答案"
+            val label = subQuestionLabel(index)
+            val formattedHtml = sub.formattedAnswerHtml
+            val formatted = formattedHtml?.let(::visiblePdfHtmlNodes)
+            if (formatted != null) {
+                // 平台答文本身可能以「（1）」开头，避免再叠加一层编号。
+                val prefix = if (formattedHtml.orEmpty().htmlStartsWithSubQuestionNumber(index)) "" else label
+                val indent = 12f
+                val answer = Div().setMarginLeft(indent).setMarginTop(2f)
+                html.addNodes(formatted, answer::add, prefix, bodyWidth - indent)
+                block.add(answer)
+                return@forEachIndexed
+            }
+            val plain = sub.plainAnswer?.takeIf(String::hasVisiblePdfText)
+            if (plain != null) {
+                val prefix = if (plain.startsWithSubQuestionNumber(index)) "" else label
+                block.add(subTextLine(prefix + plain, accent))
+                return@forEachIndexed
+            }
+            val correct = sub.choicePresentation()?.correct?.joinToString("、").orEmpty()
+            block.add(subTextLine(label + correct.ifBlank { "平台未提供" }, accent))
+        }
+    }
+
+    private fun subTextLine(value: String, color: DeviceRgb = ink): Paragraph {
+        val paragraph = Paragraph()
+        html.appendRuns(paragraph, value)
+        return paragraph.setFontColor(color).setFontSize(10.5f)
+            .setMarginTop(2f).setMarginBottom(0f).setMarginLeft(12f)
+    }
 
     private fun answerLine(value: String): Paragraph {
         html.sourceStage = "参考答案"
@@ -280,6 +326,47 @@ private class SelectableQuestionLayout(
         codePoints().forEach { if (!isPdfZeroWidthControl(it)) builder.appendCodePoint(it) }
         return builder.toString()
     }
+}
+
+private fun subQuestionLabel(index: Int): String = "（${index + 1}）"
+
+/** 平台答文偶尔自带「（1）」「(1)」或「1.」编号；已有同一编号时不再重复添加。 */
+private fun String.startsWithSubQuestionNumber(index: Int): Boolean {
+    val text = trimStart()
+    val number = index + 1
+    return text.startsWith("（$number）") || text.startsWith("($number)") ||
+        text.startsWith("$number）") || text.startsWith("$number.")
+}
+
+private fun String.htmlStartsWithSubQuestionNumber(index: Int): Boolean =
+    Jsoup.parseBodyFragment(this).body().text().trimStart().startsWithSubQuestionNumber(index)
+
+private class ChoicePresentation(
+    val bodies: List<Element>,
+    val prefixes: List<String>,
+    val correct: List<String>,
+)
+
+/** 小题与父题共用一套选项标注规则；无选项时返回 null，交给答案字段处理。 */
+private fun Question.choicePresentation(): ChoicePresentation? {
+    val choices = if (hasOptions) options else emptyList()
+    if (choices.isEmpty()) return null
+    val bodies = choices.map { Jsoup.parseBodyFragment(it.html).body() }
+    val visibleLabels = bodies.map { optionPrefix.find(it.text())?.groupValues?.get(1)?.uppercase() }
+    val sourceLabels = choices.map { it.sourceKey?.trim()?.takeIf(optionKey::matches)?.uppercase() }
+    val reservedLabels = visibleLabels.zip(sourceLabels) { visible, key -> visible ?: key }.filterNotNull().toMutableSet()
+    val judgment = questionType.contains("判断") || questionType.contains("是非")
+    val prefixes = mutableListOf<String>()
+    val correct = mutableListOf<String>()
+    choices.forEachIndexed { index, option ->
+        val body = bodies[index]
+        val semanticAnswer = body.text().replaceFirst(optionPrefix, "").trim().trimEnd('。', '！', '.', '!')
+            .takeIf { judgment && it in judgmentLabels }
+        val optionLabel = visibleLabels[index] ?: sourceLabels[index] ?: nextOptionLabel(index, reservedLabels)
+        prefixes += if (visibleLabels[index] == null && semanticAnswer == null) "$optionLabel. " else ""
+        if (option.isTrue) correct += semanticAnswer ?: optionLabel
+    }
+    return ChoicePresentation(bodies, prefixes, correct)
 }
 
 private class QuestionContinuationRenderer(

@@ -95,4 +95,50 @@ class QuestionTest {
         val opt1 = question.options.find { it.questionoptionhtml_svg == "base64opt1" }
         assertTrue(opt1 != null)
     }
+
+    @Test
+    fun testSubQuestionsDeserialization() {
+        val jsonString = """
+            {
+                "questionid": "4",
+                "questiontypename": "综合题",
+                "subjecthtml_svg": "base64subject",
+                "answerhtml_svg": "",
+                "answer": "",
+                "options": { "options": "" },
+                "subquestions": [
+                    {
+                        "questionid": "5",
+                        "questiontypename": "主观题",
+                        "subjecthtml_svg": "base64sub",
+                        "answerhtml_svg": "",
+                        "answer": "小题答案",
+                        "options": ""
+                    }
+                ]
+            }
+        """.trimIndent()
+
+        val question = json.decodeFromString<Question>(jsonString)
+
+        assertEquals(1, question.subquestions.size)
+        assertEquals("5", question.subquestions.single().id)
+        assertEquals("小题答案", question.subquestions.single().plainAnswer)
+    }
+
+    @Test
+    fun testQuestionWithoutSubQuestionsDefaultsToEmpty() {
+        val jsonString = """
+            {
+                "questionid": "6",
+                "questiontypename": "单选题",
+                "subjecthtml_svg": "base64subject",
+                "answerhtml_svg": "base64answer",
+                "answer": "A",
+                "options": []
+            }
+        """.trimIndent()
+
+        assertTrue(json.decodeFromString<Question>(jsonString).subquestions.isEmpty())
+    }
 }

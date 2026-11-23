@@ -63,6 +63,9 @@ data class Question(
 
     @SerialName("options")
     internal val options_origin: JsonElement,
+
+    /** 综合题的小题；小题与题目同构，题干和答案各自独立。 */
+    val subquestions: List<Question> = emptyList(),
 ) {
     val subjectHtml by lazy {
         subjecthtml_svg.orEmpty().toByteArray().decompress().decodeToString()
@@ -85,7 +88,7 @@ data class Question(
     }
 
     val answer by lazy {
-        formattedAnswerHtml ?: answer_origin!!
+        formattedAnswerHtml ?: answer_origin.orEmpty()
     }
 
     val formattedAnswerHtml by lazy {
