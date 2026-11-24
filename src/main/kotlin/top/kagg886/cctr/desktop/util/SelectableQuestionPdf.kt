@@ -30,9 +30,13 @@ internal data class QuestionPdfResult(
     val exportedCount: Int,
     val skippedIds: List<String>,
     val failureMessages: List<String> = emptyList(),
+    val warningMessages: List<String> = emptyList(),
 )
 
-private data class QuestionFailure(val id: String, val message: String)
+/** 整组题目都因内容不支持被跳过；任务可以保留其它分组继续出包。 */
+internal class PdfGroupSkippedException(message: String) : IllegalStateException(message)
+
+private data class QuestionFailure(val id: String, val message: String, val fatal: Exception? = null)
 
 internal suspend fun writeSelectableQuestionPdf(
     file: File,
@@ -45,13 +49,23 @@ internal suspend fun writeSelectableQuestionPdf(
     val ordered = questions.associateBy { it.id }.values.sortedWith(compareBy(naturalQuestionOrder) { it.id })
     val (exportable, skipped) = ordered.partition(Question::hasDecodableSubject)
     var failures: List<QuestionFailure> = emptyList()
+    var warnings: List<String> = emptyList()
     if (exportable.isNotEmpty()) {
         writeAtomicPdf(file) { pdf ->
-            failures = SelectableQuestionLayout(pdf, details, renderComplex).write(exportable)
+            val layout = SelectableQuestionLayout(pdf, details, renderComplex, ordered.size)
+            failures = layout.write(exportable)
+            warnings = layout.warnings.toList()
             // Keep the previous archive when nothing could be laid out, instead of replacing it
             // with a header-only PDF.
             if (failures.size == exportable.size) {
-                throw IllegalStateException(
+                val fatal = failures.firstOrNull { it.fatal != null }
+                if (fatal != null) {
+                    throw IllegalStateException(
+                        "题目 ID ${fatal.id} 无法排版：${fatal.message}",
+                        fatal.fatal,
+                    )
+                }
+                throw PdfGroupSkippedException(
                     failures.joinToString("\n") { "题目 ID ${it.id} 无法排版：${it.message}" },
                 )
             }
@@ -61,6 +75,7 @@ internal suspend fun writeSelectableQuestionPdf(
         exportedCount = exportable.size - failures.size,
         skippedIds = skipped.map(Question::id) + failures.map(QuestionFailure::id),
         failureMessages = failures.map { "${it.id}：${it.message}" },
+        warningMessages = warnings,
     )
 }
 
@@ -78,6 +93,7 @@ private class SelectableQuestionLayout(
     private val pdf: PdfDocument,
     private val details: PdfExportDetails,
     renderComplex: suspend (String) -> CapturedPdfAsset,
+    private val askedCount: Int,
 ) {
     private val pageSize = PageSize.A4
     private val side = 42f
@@ -90,7 +106,11 @@ private class SelectableQuestionLayout(
     private val accent = DeviceRgb(43, 86, 109)
     private val rule = DeviceRgb(219, 225, 230)
     private val font = createQuestionPdfFont(cached = false)
-    private val html = PdfHtmlContent(pdf, font, bodyWidth, renderComplex)
+    val warnings = mutableListOf<String>()
+    private var currentQuestionId: String? = null
+    private val html = PdfHtmlContent(pdf, font, bodyWidth, renderComplex) { message ->
+        warnings += currentQuestionId?.let { "ID $it：$message" } ?: message
+    }
     private val continuationPages = mutableMapOf<Int, Int>()
 
     suspend fun write(questions: List<Question>): List<QuestionFailure> {
@@ -105,7 +125,7 @@ private class SelectableQuestionLayout(
             document.setFont(font).setFontColor(ink).setFontSize(11f)
             document.add(heading("题库导出", 9f, accent).setMarginBottom(5f))
             document.add(heading(details.title.ifBlank { "题库" }, 20f, ink).setMarginBottom(5f))
-            document.add(heading(listOf(details.chapter, details.questionType, "共 ${questions.size} 题").filter(String::isNotBlank).joinToString(" / "), 10f, muted).setMarginBottom(15f))
+            document.add(heading(listOf(details.chapter, details.questionType, "共 $askedCount 题").filter(String::isNotBlank).joinToString(" / "), 10f, muted).setMarginBottom(15f))
             for (question in questions) {
                 val block = try {
                     // Numbering stays continuous over exported questions; the real ID is in the heading.
@@ -116,7 +136,9 @@ private class SelectableQuestionLayout(
                     failures += QuestionFailure(question.id, error.message ?: error.javaClass.simpleName)
                     continue
                 } catch (error: Exception) {
-                    throw IllegalStateException("题目 ID ${question.id} 无法排版：${error.message ?: error.javaClass.simpleName}", error)
+                    // 记录为致命，但只有在整组都失败时才上抛；同组还有成功题目时仅跳过该题。
+                    failures += QuestionFailure(question.id, error.message ?: error.javaClass.simpleName, error)
+                    continue
                 }
                 exported++
                 try {
@@ -135,12 +157,13 @@ private class SelectableQuestionLayout(
                     throw IllegalStateException("题目 ID ${question.id} 无法排版：${error.message ?: error.javaClass.simpleName}", error)
                 }
             }
-            if (exported > 0) addPageFurniture()
+            if (exported > 0) addPageFurniture(exported, askedCount)
         }
         return failures
     }
 
     private suspend fun questionBlock(number: Int, question: Question): Div {
+        currentQuestionId = question.id
         val label = "第 $number 题 · ID ${question.id}"
         val anchor = "question-$number"
         val block = Div().setBorderTop(SolidBorder(rule, 0.5f)).setPaddingTop(7f).setMarginBottom(10f)
@@ -272,19 +295,21 @@ private class SelectableQuestionLayout(
         return paragraph.setFontColor(color).setFontSize(size).setMargin(0f).setKeepWithNext(true)
     }
 
-    private fun addPageFurniture() {
-        val total = pdf.numberOfPages
+    private fun addPageFurniture(exported: Int, asked: Int) {
+        val pages = pdf.numberOfPages
         val header = listOf(details.chapter, details.questionType).filter(String::isNotBlank).joinToString(" / ")
-        for (number in 1..total) {
+        // The header still promises every matched question; the footer records what actually made it.
+        val footerLeft = if (exported < asked) "CCTR · 题库 · 实际导出 $exported/$asked 题" else "CCTR · 题库"
+        for (number in 1..pages) {
             val page = pdf.getPage(number)
             val canvas = PdfCanvas(page.newContentStreamAfter(), page.resources, pdf)
             val left = fit(details.title, bodyWidth * 0.54f)
             val right = fit(header, bodyWidth * 0.42f)
-            val pageLabel = "$number / $total"
+            val pageLabel = "$number / $pages"
             canvasText(canvas, left, side, pageSize.height - 32f)
             canvasText(canvas, right, pageSize.width - side - font.getWidth(right, 8f), pageSize.height - 32f)
             continuationPages[number]?.let { canvasText(canvas, "第 $it 题 · 续", side, pageSize.height - 55f) }
-            canvasText(canvas, "CCTR · 题库", side, 24f)
+            canvasText(canvas, footerLeft, side, 24f)
             canvasText(canvas, pageLabel, pageSize.width - side - font.getWidth(pageLabel, 8f), 24f)
             canvas.setStrokeColor(rule).setLineWidth(0.5f)
             for (y in listOf(pageSize.height - 42f, 38f)) {

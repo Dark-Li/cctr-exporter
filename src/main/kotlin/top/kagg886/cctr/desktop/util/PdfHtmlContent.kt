@@ -41,6 +41,7 @@ internal class PdfHtmlContent(
     private val font: PdfFont,
     private val width: Float,
     private val renderComplex: suspend (String) -> CapturedPdfAsset,
+    private val onWarning: (String) -> Unit = {},
 ) {
     private val fonts = PdfFontResolver(font)
     var sourceStage: String = "文档信息"
@@ -70,8 +71,8 @@ internal class PdfHtmlContent(
             }
             val selected = if (Character.isISOControl(point)) font else when (val route = fonts.route(point, null, sourceStage, bold, italic)) {
                 is GlyphRoute.Native -> route.font
-                GlyphRoute.SourceGlyph -> throw PdfSourceFont(null, "未声明").error(point, sourceStage, "纯文本缺少来源字体")
-                is GlyphRoute.Unsupported -> throw PdfSourceFont(null, "未声明")
+                GlyphRoute.SourceGlyph -> throw PdfSourceFont(emptyList(), "未声明").error(point, sourceStage, "纯文本缺少来源字体")
+                is GlyphRoute.Unsupported -> throw PdfSourceFont(emptyList(), "未声明")
                     .error(point, sourceStage, "已尝试=${route.attempts.joinToString("、")}")
             }
             if (selected !== current) {
@@ -101,7 +102,7 @@ internal class PdfHtmlContent(
         value.codePoints().forEach { point ->
             if (isPdfZeroWidthControl(point) || Character.isISOControl(point)) return@forEach
             if (!selected.containsGlyph(point)) {
-                throw PdfSourceFont(null, "未声明").error(point, sourceStage, "字体路由未覆盖")
+                throw PdfSourceFont(emptyList(), "未声明").error(point, sourceStage, "字体路由未覆盖")
             }
             val glyph = selected.fontProgram.getGlyphByCode(selected.getGlyph(point).code)
             // Shared glyphs lose their ToUnicode identity in a subset. The bundled font already
@@ -183,12 +184,14 @@ internal class PdfHtmlContent(
         suspend fun visit(node: Node, format: InlineFormat) {
             when (node) {
                 is TextNode -> {
+                    val source = PdfSourceFont.from(node)
                     var value = node.wholeText.pdfLtrText(sourceStage)
                     if (!format.preformatted) {
                         value = htmlSpaces.replace(value, " ")
                         if (!hasContent || previousSpace) value = value.trimStart(' ')
                     }
                     if (value.isEmpty()) return
+                    value = source.replaceUnrenderablePrivateUse(value, sourceStage, onWarning)
                     value.forEachIndexed { index, character ->
                         if (character == '\u2060' || character == '\uFEFF') {
                             val attachable = (index > 0 && index < value.lastIndex) ||
@@ -210,7 +213,6 @@ internal class PdfHtmlContent(
                         return
                     }
                     start()
-                    val source = PdfSourceFont.from(node)
                     val mapped = value.codePoints().toArray().map(source::mapSymbol)
                     var native = StringBuilder()
                     var runFont = font

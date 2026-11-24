@@ -35,7 +35,8 @@ class SkippedSubjectPdfTest {
         assertEquals(listOf("54058673"), result.skippedIds)
         PdfDocument(PdfReader(output)).use { pdf ->
             val text = PdfTextExtractor.getTextFromPage(pdf.getPage(1))
-            assertTrue(text.contains("共 2 题"), text)
+            assertTrue(text.contains("共 3 题"), text)
+            assertTrue(text.contains("实际导出 2/3 题"), text)
             assertTrue(text.contains("第 1 题 · ID 54058672"), text)
             assertTrue(text.contains("第 2 题 · ID 54058674"), text)
             assertTrue(text.indexOf("前一道正常题目") in 0 until text.indexOf("后一道正常题目"), text)
@@ -153,6 +154,29 @@ class SkippedSubjectPdfTest {
         }
         assertEquals("任务日志写入失败", failure.message)
         assertEquals("previous archive", archive.readText())
+    }
+
+    @Test
+    fun skipsBrowserFailureOnlyWhenAnotherQuestionInTheGroupSurvives() = runBlocking {
+        val archive = File("build/skipped-subject-pdf-validation/partial-browser.zip").apply {
+            parentFile.mkdirs()
+            delete()
+        }
+        val details = PdfExportDetails("课程", "章节", "计算题")
+        val groups = listOf(details to listOf(
+            question("1", encode("<math><mi>x</mi></math>")),
+            question("2", encode("正常题干")),
+        ))
+        val logs = mutableListOf<String>()
+        writeQuestionPdfArchive(
+            archive,
+            groups,
+            reportSkipped = { logs.addAll(it) },
+            renderComplex = { throw EOFException("浏览器截图") },
+        )
+        assertTrue(archive.isFile && archive.length() > 0)
+        assertTrue(logs.any { it.contains("已跳过题目 ID：1") }, logs.toString())
+        assertTrue(logs.any { it.contains("浏览器截图") }, logs.toString())
     }
 
     private fun question(id: String, stem: String?, formattedAnswer: String = "") =

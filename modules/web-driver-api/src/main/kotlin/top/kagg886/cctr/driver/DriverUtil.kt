@@ -145,7 +145,6 @@ suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = wit
                 if(key===previous && result[3]>0 && result[4]>0){stable=true;break;}
                 previous=key;await new Promise(resolve=>setTimeout(resolve,60));
               }
-              window.__cctrPdfOriginalBoxes=window.__cctrPdfBoxes;
               window.__cctrPdfMeasure=measure;
               return [...result,stable,...window.__cctrPdfRoot];
             });
@@ -169,29 +168,64 @@ suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = wit
         val height = plan.height
         val translateX = -bounds.left * plan.cssScale
         val translateY = -bounds.top * plan.cssScale
-        if (plan.cssScale != 1.0 || translateX != 0.0 || translateY != 0.0) {
+        // Pure translation needs no transform: the clip below can start at the content origin.
+        // Transforming for alignment would also make #pdf-asset a containing block, which resizes
+        // percentage-sized absolutely positioned children (observed: a 9px formula image collapsed
+        // to 0x0 and dropped the whole question).
+        val scaled = plan.cssScale != 1.0
+        if (scaled) {
             val validation = executeAsyncScript(
                 """
                 const [s,x,y,done]=arguments;
                 const asset=document.getElementById('pdf-asset');
-                const original=window.__cctrPdfOriginalBoxes;
-                asset.style.transformOrigin='0 0';asset.style.transform='matrix('+[s,0,0,s,x,y].join(',')+')';
-                requestAnimationFrame(()=>requestAnimationFrame(()=>{
-                  window.__cctrPdfMeasure();const current=window.__cctrPdfBoxes;
+                const apply=value=>{asset.style.transformOrigin='0 0';asset.style.transform=value;};
+                // Content may still settle after the first measurement (late image decode, font swap).
+                // Measure each state until two consecutive frames agree, then compare like states.
+                const stable=()=>new Promise(resolve=>{
+                  let previous='',attempt=0;
+                  const step=()=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
+                    window.__cctrPdfMeasure();
+                    const boxes=window.__cctrPdfBoxes.slice();
+                    const key=JSON.stringify([boxes.length,...(boxes.length?[boxes[0].left,boxes[0].top]:[])]);
+                    if(attempt>0&&key===previous){resolve(boxes);return;}
+                    previous=key;attempt++;
+                    if(attempt>=3){resolve(boxes);return;}
+                    step();
+                  }));
+                  step();
+                });
+                const union=boxes=>boxes.length?boxes.reduce((a,b)=>({
+                  left:Math.min(a.left,b.left),top:Math.min(a.top,b.top),
+                  right:Math.max(a.left+a.width,b.left+b.width),bottom:Math.max(a.top+a.height,b.top+b.height)}),
+                  {left:Infinity,top:Infinity,right:-Infinity,bottom:-Infinity}):null;
+                (async()=>{
+                  apply('none');
+                  const original=await stable();
+                  apply('matrix('+[s,0,0,s,x,y].join(',')+')');
+                  const current=await stable();
                   let delta=0;
-                  if(original.length!==current.length)delta=Infinity;
-                  else for(let i=0;i<original.length;i++){
-                    const a=original[i],b=current[i];
-                    delta=Math.max(delta,Math.abs(b.left-(a.left*s+x)),Math.abs(b.top-(a.top*s+y)),
-                      Math.abs(b.width-a.width*s),Math.abs(b.height-a.height*s));
+                  if(original.length===current.length){
+                    for(let i=0;i<original.length;i++){
+                      const a=original[i],b=current[i];
+                      delta=Math.max(delta,Math.abs(b.left-(a.left*s+x)),Math.abs(b.top-(a.top*s+y)),
+                        Math.abs(b.width-a.width*s),Math.abs(b.height-a.height*s));
+                    }
+                  } else {
+                    // Box count drift changes nothing for cropping as long as the covered area maps
+                    // exactly; compare the union box instead of failing a whole question.
+                    const a=union(original),b=union(current);
+                    delta=(a&&b)?Math.max(Math.abs(b.left-(a.left*s+x)),Math.abs(b.top-(a.top*s+y)),
+                      Math.abs(b.right-(a.right*s+x)),Math.abs(b.bottom-(a.bottom*s+y))):Infinity;
                   }
-                  done([Number.isFinite(delta)&&delta<=0.25,Number.isFinite(delta)?delta:null,original.length,current.length]);
-                }));
+                  done([Number.isFinite(delta)&&delta<=0.25,Number.isFinite(delta)?delta:null,
+                    original.length,current.length]);
+                })();
                 """.trimIndent(), plan.cssScale, translateX, translateY,
             ) as? List<*>
             require(validation?.firstOrNull() == true) {
                 "局部内容几何失败；原因=layout-context-changed；类型=$kind；CSS=${bounds.width}x${bounds.height}；" +
-                    "原点=${bounds.left},${bounds.top}；DPR=$devicePixelRatio；scale=${plan.cssScale}；delta=${validation?.getOrNull(1)}"
+                    "原点=${bounds.left},${bounds.top}；DPR=$devicePixelRatio；scale=${plan.cssScale}；delta=${validation?.getOrNull(1)}；" +
+                    "盒子=${validation?.getOrNull(2)}/${validation?.getOrNull(3)}"
             }
         }
         verifyPdfTextFont()
@@ -199,7 +233,11 @@ suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = wit
         val scale = pixelsPerCssPixel / devicePixelRatio
         executeCdpCommand("Emulation.setDefaultBackgroundColorOverride", mapOf("color" to mapOf("r" to 0, "g" to 0, "b" to 0, "a" to 0)))
         try {
-            val clip = mapOf("x" to 0, "y" to 0, "width" to width, "height" to height, "scale" to scale)
+            // Unscaled content keeps its layout origin; bounds never start inside the content, so
+            // clamping to the page origin only trims leading padding.
+            val clipX = if (scaled) 0.0 else bounds.left.coerceAtLeast(0.0)
+            val clipY = if (scaled) 0.0 else bounds.top.coerceAtLeast(0.0)
+            val clip = mapOf("x" to clipX, "y" to clipY, "width" to width, "height" to height, "scale" to scale)
             val screenshot = executeCdpCommand(
                 "Page.captureScreenshot",
                 mapOf("format" to "png", "fromSurface" to true, "captureBeyondViewport" to true, "clip" to clip)
@@ -210,10 +248,12 @@ suspend fun EdgeDriver.capturePdfAsset(fragment: String): CapturedPdfAsset = wit
             check(image.width == width * pixelsPerCssPixel && image.height == height * pixelsPerCssPixel) {
                 "局部渲染像素尺寸与公式边界不符"
             }
+            // Scaled content was translated so its bounds start at 0; unscaled content keeps the page origin.
+            val originTop = if (scaled) bounds.top else 0.0
             CapturedPdfAsset(
                 image, width, height, (contentHeight * plan.cssScale).toFloat(),
-                (height - ((dimensions[8] as Number).toDouble() + contentHeight - bounds.top) * plan.cssScale).toFloat().coerceAtLeast(0f),
-                (dimensions[6] as? Number)?.let { (height - (it.toDouble() - bounds.top) * plan.cssScale).toFloat() },
+                (height - ((dimensions[8] as Number).toDouble() + contentHeight - originTop) * plan.cssScale).toFloat().coerceAtLeast(0f),
+                (dimensions[6] as? Number)?.let { (height - (it.toDouble() - originTop) * plan.cssScale).toFloat() },
                 plan.cssScale.toFloat(),
             )
         } finally {

@@ -4,8 +4,9 @@ package top.kagg886.cctr.desktop.util
 internal fun String.pdfLtrText(stage: String): String {
     val output = StringBuilder()
     codePoints().forEach { point ->
-        // LRM has no visible glyph. Its strong-L effect is redundant only in this verified LTR scope.
-        if (point == 0x200E) return@forEach
+        // LRM/RLM have no visible glyph. Their strong-direction effect is redundant only in this
+        // verified LTR scope; real RTL characters are still rejected by the directionality check.
+        if (point == 0x200E || point == 0x200F) return@forEach
         val bidi = Character.getDirectionality(point)
         if (isPdfBidiControl(point) || bidi == Character.DIRECTIONALITY_RIGHT_TO_LEFT ||
             bidi == Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC
