@@ -7,6 +7,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import top.kagg886.cctr.api.modules.Question
 import top.kagg886.cctr.desktop.util.PdfExportDetails
+import top.kagg886.cctr.desktop.util.PdfGroupSkippedException
+import top.kagg886.cctr.desktop.util.QuestionPdfResult
 import top.kagg886.cctr.desktop.util.writeAtomicFile
 import top.kagg886.cctr.desktop.util.writeSelectableQuestionPdf
 import top.kagg886.cctr.driver.CapturedPdfAsset
@@ -24,6 +26,7 @@ internal suspend fun writeQuestionPdfArchive(
 ): Int {
     val skippedIds = linkedSetOf<String>()
     val failureMessages = mutableListOf<String>()
+    val warningMessages = mutableListOf<String>()
     var exportedCount = 0
     val ordered = groups.toList()
     useTempDictionarySuspend { output ->
@@ -40,6 +43,16 @@ internal suspend fun writeQuestionPdfArchive(
                         Result.success(result)
                     } catch (error: CancellationException) {
                         throw error
+                    } catch (error: PdfGroupSkippedException) {
+                        // 整组都是不受支持的内容：保留其它分组继续出包，并把题目 ID 全部上报。
+                        runCatching { onGroupProcessed(group.size) }
+                        Result.success(
+                            QuestionPdfResult(
+                                exportedCount = 0,
+                                skippedIds = group.map(Question::id),
+                                failureMessages = listOf("整组未导出：${error.message}"),
+                            )
+                        )
                     } catch (error: Exception) {
                         // Returning the failure keeps the cause chain intact; rethrowing across a
                         // dispatcher boundary makes kotlinx.coroutines copy the exception.
@@ -54,13 +67,17 @@ internal suspend fun writeQuestionPdfArchive(
             }.awaitAll()
         }
         results.firstOrNull { it.isFailure }?.exceptionOrNull()?.let { throw it }
-        results.forEach {
-            val result = it.getOrThrow()
-            exportedCount += result.exportedCount
-            skippedIds.addAll(result.skippedIds)
-            failureMessages.addAll(result.failureMessages)
+        results.forEach { result ->
+            val value = result.getOrThrow()
+            exportedCount += value.exportedCount
+            skippedIds.addAll(value.skippedIds)
+            failureMessages.addAll(value.failureMessages)
+            warningMessages.addAll(value.warningMessages)
         }
-        val messages = skippedPdfLogMessages(skippedIds) + failureLogMessages(failureMessages)
+        val messages = warningSummaryMessages(warningMessages) +
+            skippedPdfLogMessages(skippedIds) +
+            failureLogMessages(failureMessages) +
+            warningLogMessages(warningMessages)
         if (exportedCount > 0) {
             writeAtomicFile(archive) { temporary ->
                 output.zip(temporary)
@@ -103,5 +120,13 @@ private fun skippedPdfLogMessages(skippedIds: Set<String>): List<String> = build
 
 private fun failureLogMessages(failures: List<String>): List<String> = failures.map { failure ->
     val line = "排版失败：$failure"
+    if (line.length <= 200) line else line.take(199) + "…"
+}
+
+private fun warningSummaryMessages(warnings: List<String>): List<String> =
+    if (warnings.isEmpty()) emptyList() else listOf("${warnings.size} 处字符无法还原，已用 � 替代")
+
+private fun warningLogMessages(warnings: List<String>): List<String> = warnings.map { warning ->
+    val line = "占位：$warning"
     if (line.length <= 200) line else line.take(199) + "…"
 }

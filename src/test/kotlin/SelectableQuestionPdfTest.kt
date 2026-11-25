@@ -47,6 +47,7 @@ class SelectableQuestionPdfTest {
             assertFalse(text.contains("被覆盖的旧题目版本"), text)
             assertEquals(2, pdf.getOutlines(false).allChildren.size)
             assertEquals(2, pdf.catalog.getNameTree(PdfName.Dests).names.size)
+            assertFalse(text.contains("实际导出"), text)
             assertEquals(595f, pdf.getPage(1).pageSize.width, 0.1f)
         }
     }

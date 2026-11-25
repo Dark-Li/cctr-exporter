@@ -66,18 +66,28 @@ class DirectionAndNativeFontPdfTest {
 
     @Test
     fun rejectsUnsupportedBidiAndDoesNotDeleteOtherFormatControls() = runBlocking {
-        for (body in listOf("<p>前文\u200E مرحبا</p>", "<p>前文\u200F后文</p>", "<p>前文\u202E后文</p>",
+        for (body in listOf("<p>前文\u200E مرحبا</p>", "<p>前文\u202E后文</p>",
             "<style>.r{direction:rtl}</style><p class='r'>A\u200E (12)</p>")) {
             val error = assertFailsWith<IllegalStateException> {
                 writeSelectableQuestionPdf(File("build/direction-font-pdf-validation/rtl.pdf"), PdfExportDetails("方向"), listOf(question(body, "答案")))
             }
             assertTrue(error.message.orEmpty().contains("双向文本"), error.message)
         }
-        val error = assertFailsWith<IllegalStateException> {
-            writeSelectableQuestionPdf(File("build/direction-font-pdf-validation/unknown.pdf"), PdfExportDetails("未知源"),
-                listOf(question("<font face='Times New Roman'>&#xF070;</font>", "答案")))
+        val rlmOutput = File("build/direction-font-pdf-validation/rlm.pdf")
+        val rlm = writeSelectableQuestionPdf(rlmOutput, PdfExportDetails("方向"), listOf(question("<p>前文\u200F后文</p>", "答案")))
+        assertTrue(rlm.exportedCount == 1, rlm.failureMessages.toString())
+        PdfDocument(PdfReader(rlmOutput)).use { pdf ->
+            val text = PdfTextExtractor.getTextFromPage(pdf.getPage(1))
+            assertTrue(text.contains("前文后文"), text)
         }
-        assertTrue(error.message.orEmpty().contains("U+F070"), error.message)
+        val unknownOutput = File("build/direction-font-pdf-validation/unknown.pdf")
+        val unknown = writeSelectableQuestionPdf(unknownOutput, PdfExportDetails("未知源"),
+            listOf(question("<font face='Times New Roman'>&#xF070;</font>", "答案")))
+        assertTrue(unknown.exportedCount == 1, unknown.failureMessages.toString())
+        assertTrue(unknown.warningMessages.single().contains("U+F070"), unknown.warningMessages.single())
+        PdfDocument(PdfReader(unknownOutput)).use { pdf ->
+            assertTrue(PdfTextExtractor.getTextFromPage(pdf.getPage(1)).contains("\uFFFD"), "placeholder missing")
+        }
     }
 
     @Test

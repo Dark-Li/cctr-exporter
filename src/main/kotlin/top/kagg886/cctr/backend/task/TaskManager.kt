@@ -7,14 +7,16 @@ import top.kagg886.cctr.api.modules.QueryModel
 import top.kagg886.cctr.api.modules.queryQuestionList
 import top.kagg886.cctr.backend.dao.Task
 import top.kagg886.cctr.backend.dao.Tasks
+import top.kagg886.cctr.backend.dao.Loggers
 import top.kagg886.cctr.backend.dao.Tasks.ExportType.PDF
 import top.kagg886.cctr.backend.service.TaskService
-import top.kagg886.cctr.backend.util.error
 import top.kagg886.cctr.backend.util.info
+import top.kagg886.cctr.backend.util.logAndSave
 import top.kagg886.cctr.backend.util.warnAndSave
 import top.kagg886.cctr.desktop.trayChannel
 import top.kagg886.cctr.desktop.util.PdfExportDetails
 import top.kagg886.cctr.desktop.util.root_file
+import top.kagg886.cctr.driver.CapturedPdfAsset
 import top.kagg886.cctr.driver.WebDriverDispatcher
 import top.kagg886.cctr.driver.capturePdfAsset
 import top.kagg886.cctr.driver.captchaImage
@@ -45,7 +47,7 @@ object TaskManager {
             TaskService.query {
                 where { Tasks.status eq Tasks.TaskStatus.PROCESSING }
             }.forEach {
-                it.error("系统重启，任务自动失败")
+                it.logAndSave(Loggers.LoggerLevel.ERROR, "系统重启，任务自动失败")
                 TaskService.update(it.copy(status = Tasks.TaskStatus.FAILED))
             }
 
@@ -157,7 +159,7 @@ object TaskManager {
                     groups,
                     onGroupProcessed = { count -> repeat(count) { progressChannel.send(0) } },
                     reportSkipped = task::warnAndSave,
-                    renderComplex = { fragment -> WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) } },
+                    renderComplex = ::capturePdfAssetWithRetry,
                 )
             } else useTempDictionarySuspend { root ->
                 //download image
@@ -236,7 +238,7 @@ object TaskManager {
             }
         } catch (e: Throwable) {
             e.printStackTrace()
-            task.error("任务执行失败:${e::class.jvmName} ${e.message}")
+            task.logAndSave(Loggers.LoggerLevel.ERROR, "任务执行失败:${e::class.jvmName} ${e.message}")
             check(TaskService.update(task.copy(status = Tasks.TaskStatus.FAILED))) {
                 "修改数据库内任务状态失败!"
             }
@@ -252,4 +254,14 @@ object TaskManager {
             else "部分导出完成，${skippedPdfSummary(skippedPdfCount)}"
         trayChannel.send("任务id:${task.id}$result")
     }
+}
+
+/** 局部截图偶尔会因图片/字体瞬时重排失败；换一次干净会话重试后再交给逐题隔离。 */
+private suspend fun capturePdfAssetWithRetry(fragment: String): CapturedPdfAsset = try {
+    WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) }
+} catch (error: CancellationException) {
+    throw error
+} catch (error: Exception) {
+    delay(150)
+    WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) }
 }

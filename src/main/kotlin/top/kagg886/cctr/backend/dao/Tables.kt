@@ -29,7 +29,9 @@ object Tasks : IntIdTable("task") {
 object Loggers : IntIdTable("logger") {
     val taskId = reference("task_id", Tasks)
     val level = enumerationByName("level", 32, LoggerLevel::class)
-    val message = varchar("message", 200)
+
+    /** 失败原因可能包含多道题的完整说明，超出 200 字符不能让整条日志丢失。 */
+    val message = text("message")
     val createTime = datetime("create_time").default(LocalDateTime.now())
 
     enum class LoggerLevel {
